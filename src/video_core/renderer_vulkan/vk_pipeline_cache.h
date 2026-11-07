@@ -274,6 +274,7 @@ private:
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
+    void LogEvictionPolicy() const;
     u64 frame_count{};
     /// Wait budget of native draws for unbuilt pipelines left in this frame, in microseconds
     /// (native_async_draws = Bounded). Only touched on the GPU thread; reset in TickFrame.

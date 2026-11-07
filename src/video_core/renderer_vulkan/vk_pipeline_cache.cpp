@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -47,6 +48,7 @@
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/mesh_fallback_limits.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
+#include "video_core/renderer_vulkan/pipeline_eviction_policy.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/pipeline_shader_emission.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
@@ -689,6 +691,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     }
 
     LOG_INFO(Render_Vulkan, "DynamicState setting value: {}", u32(Settings::values.dyna_state.GetValue()));
+    LogEvictionPolicy();
 
     dynamic_features = {};
     // Keys without the driver, so that a driver update keeps the recorded pipelines
@@ -813,6 +816,34 @@ bool PreloadAllPipelines() {
         return value != nullptr && value[0] == '1';
     }();
     return all;
+}
+
+// A graphics pipeline unused for this many frames (~2.5 min at 60 FPS) may be destroyed.
+constexpr u64 EvictAfterFrames = 9000;
+
+// Built graphics pipelines kept before unused ones are destroyed; 0 destroys every pipeline unused
+// for EvictAfterFrames (Android, or EDEN_NX2_KEPT_PIPELINES=0). EDEN_NX2_KEPT_PIPELINES=<n> sets
+// the limit on desktop.
+size_t KeptPipelines() {
+    static const size_t kept = []() -> size_t {
+#ifdef __ANDROID__
+        return 0;
+#else
+        const char* value = std::getenv("EDEN_NX2_KEPT_PIPELINES");
+        if (value == nullptr || value[0] == '\0') {
+            return DefaultKeptPipelines;
+        }
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(value, &end, 10);
+        if (end == value || *end != '\0' || value[0] == '-') {
+            LOG_WARNING(Render_Vulkan, "EDEN_NX2_KEPT_PIPELINES={} is not a number, using {}",
+                        value, DefaultKeptPipelines);
+            return DefaultKeptPipelines;
+        }
+        return static_cast<size_t>(parsed);
+#endif
+    }();
+    return kept;
 }
 } // Anonymous namespace
 
@@ -2031,41 +2062,73 @@ void PipelineCache::EvictUnusedPipelines() {
     }
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
-    // this long is destroyed; rebuilding it later requires a full GPU-thread shader translation
-    // (~8.5 ms each) plus a driver pipeline cache hit.
-    constexpr u64 EvictAfterFrames = 9000;
+    // EvictAfterFrames may be destroyed. Rebuilding it later requires a full GPU-thread shader
+    // translation (~8.5 ms each) plus a driver pipeline cache hit, and pausing or a long cutscene
+    // evicts an area's pipelines so returning rebuilds them all at once (OoT: 8,158 rebuilt in
+    // 80 min, multi-second freezes). So on desktop they are only destroyed past KeptPipelines()
+    // built, least recently used first.
     if (frame_count <= EvictAfterFrames) {
         return;
     }
     const u64 cutoff = frame_count - EvictAfterFrames;
     const u64 tick = scheduler.CurrentTick();
-    // ~0.9 GB of driver memory at ~0.45 MB each.
-    constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
-    size_t kept_prebuilt = 0;
     size_t evicted = 0;
-    for (auto it = graphics_cache.begin(); it != graphics_cache.end();) {
-        GraphicsPipeline* const pipeline = it->second.get();
-        if (pipeline == nullptr || pipeline == current_pipeline || !pipeline->IsBuilt() ||
-            pipeline->LastUse() >= cutoff) {
-            ++it;
-            continue;
-        }
-        // A pipeline built from the disk cache at boot that no draw has used yet stays, up to a
-        // budget: evicting it throws the prebuild away, and the game translates it again on the
-        // GPU thread when it reaches that content (OoT: 1174 of 1346 evicted on the title screen,
-        // 684 rebuilt in 10 s on entering the field). Past the budget they go like the rest, so a
-        // large cache can't hold their driver memory for the whole session.
-        if (!pipeline->WasUsed() && kept_prebuilt < MaxUnusedPrebuiltPipelines) {
-            ++kept_prebuilt;
-            ++it;
-            continue;
-        }
-        if (used_this_session.erase(pipeline) != 0) {
+    const auto evict = [&](auto it) {
+        if (used_this_session.erase(it->second.get()) != 0) {
             used_and_evicted.insert(it->first.Hash());
         }
         evicted_pipelines.emplace_back(tick, std::move(it->second));
-        it = graphics_cache.erase(it);
         ++evicted;
+        return graphics_cache.erase(it);
+    };
+    const auto evictable = [&](const GraphicsPipeline* pipeline) {
+        return pipeline != nullptr && pipeline != current_pipeline && pipeline->IsBuilt() &&
+               pipeline->LastUse() < cutoff;
+    };
+    if (const size_t kept = KeptPipelines(); kept != 0) {
+        const size_t built = static_cast<size_t>(
+            std::count_if(graphics_cache.begin(), graphics_cache.end(), [](const auto& entry) {
+                return entry.second != nullptr && entry.second->IsBuilt();
+            }));
+        if (built <= kept) {
+            return;
+        }
+        std::vector<GraphicsPipelineCacheKey> keys;
+        std::vector<u64> last_uses;
+        for (const auto& [key, pipeline] : graphics_cache) {
+            if (evictable(pipeline.get())) {
+                keys.push_back(key);
+                // A prebuilt pipeline no draw has used counts as used at boot.
+                last_uses.push_back(pipeline->WasUsed() ? pipeline->LastUse() : 0);
+            }
+        }
+        for (const size_t index : PipelinesToEvict(last_uses, built, kept)) {
+            if (const auto it = graphics_cache.find(keys[index]); it != graphics_cache.end()) {
+                evict(it);
+            }
+        }
+    } else {
+        // ~0.9 GB of driver memory at ~0.45 MB each.
+        constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
+        size_t kept_prebuilt = 0;
+        for (auto it = graphics_cache.begin(); it != graphics_cache.end();) {
+            GraphicsPipeline* const pipeline = it->second.get();
+            if (!evictable(pipeline)) {
+                ++it;
+                continue;
+            }
+            // A pipeline built from the disk cache at boot that no draw has used yet stays, up to
+            // a budget: evicting it throws the prebuild away, and the game translates it again on
+            // the GPU thread when it reaches that content (OoT: 1174 of 1346 evicted on the title
+            // screen, 684 rebuilt in 10 s on entering the field). Past the budget they go like the
+            // rest, so a large cache can't hold their driver memory for the whole session.
+            if (!pipeline->WasUsed() && kept_prebuilt < MaxUnusedPrebuiltPipelines) {
+                ++kept_prebuilt;
+                ++it;
+                continue;
+            }
+            it = evict(it);
+        }
     }
     if (evicted == 0) {
         return;
@@ -2077,6 +2140,19 @@ void PipelineCache::EvictUnusedPipelines() {
     }
     LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
              EvictAfterFrames, graphics_cache.size());
+}
+
+void PipelineCache::LogEvictionPolicy() const {
+    if (device.IsMoltenVK()) {
+        LOG_INFO(Render_Vulkan, "Pipeline eviction: off on MoltenVK");
+    } else if (const size_t kept = KeptPipelines(); kept != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "Pipeline eviction: unused pipelines are destroyed only past {} built", kept);
+    } else {
+        LOG_INFO(Render_Vulkan,
+                 "Pipeline eviction: pipelines unused for {} frames are destroyed",
+                 EvictAfterFrames);
+    }
 }
 
 /// Returns `pipeline` when it is built or the current draw must wait for it, and nullptr when the
