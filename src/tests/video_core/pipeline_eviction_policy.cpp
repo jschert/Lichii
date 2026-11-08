@@ -6,6 +6,8 @@
 #include "video_core/renderer_vulkan/pipeline_eviction_policy.h"
 
 using Vulkan::DefaultKeptPipelines;
+using Vulkan::KeptPipelinesForCache;
+using Vulkan::MaxKeptPipelines;
 using Vulkan::PipelinesToEvict;
 
 namespace {
@@ -59,4 +61,16 @@ TEST_CASE("A limit of 0 evicts every candidate (old behaviour)",
     const std::vector<u64> last_uses{30, 10, 20};
     REQUIRE(PipelinesToEvict(last_uses, 3, 0) == std::vector<size_t>{0, 1, 2});
     REQUIRE(PipelinesToEvict(last_uses, 1'000'000, 0).size() == 3);
+}
+
+TEST_CASE("The default limit fits the disk cache loaded at boot",
+          "[video_core][pipeline_eviction]") {
+    // A small or empty cache keeps the base limit.
+    REQUIRE(KeptPipelinesForCache(0) == DefaultKeptPipelines);
+    REQUIRE(KeptPipelinesForCache(1600) == DefaultKeptPipelines);
+    // OoT's 7,316 cached pipelines all fit, with room for 1,024 new ones.
+    REQUIRE(KeptPipelinesForCache(7316) == 7316 + DefaultKeptPipelines / 4);
+    // A huge cache is capped, so it can't hold its driver memory without bound.
+    REQUIRE(KeptPipelinesForCache(48'000) == MaxKeptPipelines);
+    static_assert(KeptPipelinesForCache(MaxKeptPipelines) == MaxKeptPipelines);
 }

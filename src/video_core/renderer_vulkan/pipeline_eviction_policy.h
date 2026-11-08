@@ -18,6 +18,18 @@ namespace Vulkan {
 /// thread (35.5 s of builds, 66.7 s of draws held), while no more than ~2,000 were alive at once.
 inline constexpr size_t DefaultKeptPipelines = 4096;
 
+/// The most built pipelines kept by default however large the disk cache is (~5.5 GB).
+inline constexpr size_t MaxKeptPipelines = 12288;
+
+/// Default limit for a session that loaded `cached_at_boot` pipelines from the disk cache: the
+/// whole cache plus room for new content, so the cache's own pipelines are not evicted and built
+/// again on the GPU thread (OoT, 7,316 cached with a limit of 4096: 3,925 evicted, 1,395 rebuilt).
+constexpr size_t KeptPipelinesForCache(size_t cached_at_boot) {
+    const size_t wanted = cached_at_boot + DefaultKeptPipelines / 4;
+    return wanted < DefaultKeptPipelines ? DefaultKeptPipelines
+                                         : (wanted > MaxKeptPipelines ? MaxKeptPipelines : wanted);
+}
+
 /// Picks which unused pipelines to destroy so that at most `kept` stay built.
 /// @param last_uses Frame each candidate was last used (0 for a prebuilt one no draw has used).
 ///                  Candidates are built pipelines old enough to evict and not the current one.
