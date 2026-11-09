@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -13,9 +14,39 @@
 #include <utility>
 
 #include "common/logging.h"
+#include "common/thread_worker.h"
 #include "video_core/shader_jobs.h"
 
 namespace Vulkan {
+
+/// EDEN_NX2_FAST_FIRST=1: a pipeline built while the game runs is first created with
+/// VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT and drawn with as soon as the driver returns it;
+/// the optimized build follows on a worker and takes its place at a later draw. Trades the seconds
+/// the driver spends on the heaviest pipelines (a demanding Switch 2 test title, first visit:
+/// draws held up to 7 s of every 10 s) for a slower shader during that time.
+inline bool FastFirstBuildEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_FAST_FIRST");
+        return value && *value && *value != '0';
+    }();
+    return enabled;
+}
+
+/// EDEN_NX2_HEAVY_SKIP: a native pipeline of at least this many converted instructions (all
+/// stages) has its draws skipped while the driver builds it, instead of holding every draw
+/// behind it. "1" picks 4000; 0 or unset turns it off. In a demanding Switch 2 test title's first
+/// visits every driver build over 500 ms was above 4000, and they made ~90% of the compile time.
+inline size_t HeavySkipWords() {
+    static const size_t words = [] {
+        const char* value = std::getenv("EDEN_NX2_HEAVY_SKIP");
+        if (!value || !*value) {
+            return size_t{0};
+        }
+        const size_t parsed = static_cast<size_t>(std::strtoull(value, nullptr, 10));
+        return parsed == 1 ? size_t{4000} : parsed;
+    }();
+    return words;
+}
 
 /// Bytes of translated IR that pipelines hold until their job emits the SPIR-V. The scheduler
 /// counts a job's bytes only while one of its stages runs, so a pipeline whose IR doesn't fit
@@ -75,6 +106,9 @@ struct PipelineBuildQueue {
     u64 driver_bytes{};
     /// Left for Build(), the driver stage of the job that translated it
     bool owner_builds{};
+    /// Priority of the job. Optional builds (the optimized build of a fast first build) are
+    /// Background: a job still queued when the pipeline goes is dropped.
+    VideoCommon::ShaderJobPriority priority{VideoCommon::ShaderJobPriority::Soon};
 };
 
 class PipelineBuild {
@@ -131,7 +165,7 @@ public:
           owner_builds{queue.owner_builds} {
         if (jobs) {
             VideoCommon::ShaderJob job{
-                .priority = VideoCommon::ShaderJobPriority::Soon,
+                .priority = queue.priority,
                 .cpu_bytes = queue.cpu_bytes,
                 .driver_bytes = queue.driver_bytes,
             };
@@ -161,7 +195,26 @@ public:
         }
     }
 
+    /// An optional build on a pool of its own (EDEN_NX2_GPL_OPTIMIZE_THREADS), outside the shader
+    /// job scheduler. Without `workers` it is built here.
+    /// @param drop_unstarted  Destroying the build before a worker started it drops the task
+    ///                        instead of running it on the destroying thread.
+    PipelineBuild(Common::ThreadWorker* workers, std::function<void()> task,
+                  bool drop_unstarted_)
+        : state{std::make_shared<State>(std::move(task))}, drop_unstarted{drop_unstarted_} {
+        if (workers) {
+            workers->QueueWork([state = state] { state->Run(); });
+        } else {
+            state->Run();
+        }
+    }
+
     ~PipelineBuild() {
+        if (drop_unstarted && !state->claimed.exchange(true)) {
+            state->task = {};
+            state->Complete();
+            return;
+        }
         if (jobs) {
             // Nothing needs a pipeline that goes: a build still queued is dropped.
             jobs->Cancel(handle);
@@ -231,6 +284,7 @@ private:
     VideoCommon::ShaderJobScheduler* jobs{};
     VideoCommon::ShaderJobHandle handle;
     bool owner_builds{};
+    bool drop_unstarted{};
 };
 
 } // namespace Vulkan

@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <span>
 
 #include <boost/container/small_vector.hpp>
@@ -100,9 +101,11 @@ public:
     /// Advances the frame window of EDEN_NX2_UPSCALER_TRACE
     static void TickUpscalerTrace();
 
-    /// Whether no build of this pipeline is left queued on a worker thread, which holds it
+    /// Whether no build of this pipeline is left queued on a worker thread, which holds it, the
+    /// optimized build of a fast first build included
     [[nodiscard]] bool IsBuildTaskDone() const noexcept {
-        return !jobs || job.Ready();
+        // The job first: once it is done, optimized_build is no longer written by its build.
+        return (!jobs || job.Ready()) && (!optimized_build || optimized_build->IsBuilt());
     }
 
     /// Builds it on this thread, for a pipeline made with PipelineBuildQueue::owner_builds
@@ -113,6 +116,8 @@ public:
 private:
     /// Builds the pipeline once, on whichever thread gets here first.
     void RunBuild();
+    /// The driver object for this shader; `fast` asks for an unoptimized build.
+    vk::Pipeline MakeComputePipeline(bool fast);
 
     const Device& device;
     vk::PipelineCache& pipeline_cache;
@@ -137,6 +142,14 @@ private:
     vk::PipelineLayout pipeline_layout;
     vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
+    /// Fast first build (FastFirstBuildEnabled): the optimized pipeline once its build is done, and
+    /// the unoptimized one kept alive after the swap for the command buffers that bound it.
+    vk::Pipeline optimized_pipeline;
+    vk::Pipeline retired_pipeline;
+    std::atomic_bool optimized_ready{};
+    bool optimized_bound{};
+    /// The optimized build of a fast first build, a Background job of `jobs`
+    std::optional<PipelineBuild> optimized_build;
 
     std::function<void()> build_task;
     std::atomic_bool build_claimed{false};
