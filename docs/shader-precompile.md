@@ -57,10 +57,14 @@ Hooks in existing files are marked `nx2 shaderwarm`.
 | `EDEN_NX2_PRECOMPILE_COMPUTE_BUILD=0` | on | don't build compute pipelines for the driver cache |
 | `EDEN_NX2_PRECOMPILE_VERIFY=0` | on | skip the cached-form SPIR-V check |
 | `EDEN_NX2_PRECOMPILE_TRACE=<file>` | unset | "begin/end <source>" per stage (finds a program that crashes the recompiler) |
+| `EDEN_NX2_PRECOMPILE_POINTER_VARIANTS=0` | on | no storage-pointer variant records (about 10x smaller file) |
+| `EDEN_NX2_PRECOMPILE_POINTER_MAX=<n>` | 6 | pointers per stage whose mapped/null combinations get records (at most 10) |
 | `EDEN_NX2_IR_CACHE=0` | on if the file exists | ignore vulkan_ir.bin |
 | `EDEN_NX2_IR_CACHE_COMPUTE=0` | on | no compute records |
 | `EDEN_NX2_IR_CACHE_TASKMESH=1` | off | task/mesh records (one precompile run with them stalled; unexplained) |
 | `EDEN_NX2_IR_CACHE_CHECK=1` | off | also translate each hit live and compare the SPIR-V |
+| `EDEN_NX2_IR_LEARN=1` | off | append stages translated live to vulkan_ir.bin (with the same checks) |
+| `EDEN_NX2_IR_MISMATCH_LOG=1` | off | name the answer that rejected a record; log learned records |
 | `EDEN_NX2_GPL=1` | off | graphics pipeline libraries + dynamic rendering |
 | `EDEN_NX2_GPL_ATTRS=0` | on with GPL (RADV) | vertex stages keep typed attributes (no VK_EXT_legacy_vertex_attributes) |
 | `EDEN_NX2_GPL_LTO=0` | on with GPL | keep fast-linked pipelines (no optimized link) |
@@ -97,8 +101,9 @@ compute records.
 - `EDEN_NX2_IR_LEARN=1`: a stage translated live (no record, or its record's answers differ) is
   appended to `vulkan_ir.bin` with the same checks, so it is translated once per build, not once
   per session.
-- `EDEN_NX2_PRECOMPILE_POINTER_VARIANTS` / `_POINTER_MAX`: a record per mapped/null combination of
-  a stage's storage pointers (up to 6 pointers). Large: about 10x the file size.
+- Pointer variants (on by default; `EDEN_NX2_PRECOMPILE_POINTER_VARIANTS=0` turns them off,
+  `EDEN_NX2_PRECOMPILE_POINTER_MAX=<n>` sets the limit, default 6, at most 10): a record per
+  mapped/null combination of a stage's storage pointers. Large: about 10x the file size.
 - `EDEN_NX2_IR_CACHE_CHECK=1`: every cache hit is also translated live and the SPIR-V compared
   ("NX2PC check ... same as live" / "DIFFERS from live"; a difference uses the live result).
   `EDEN_NX2_IR_MISMATCH_LOG=1` names the answer that rejected a record.

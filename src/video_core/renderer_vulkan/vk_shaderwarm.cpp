@@ -31,6 +31,7 @@
 #include "common/cityhash.h"
 #include "common/scope_exit.h"
 #include "common/scm_rev.h"
+#include "common/settings.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/memory_detect.h"
@@ -83,10 +84,14 @@ namespace Nx2 {
 constexpr u32 IrCacheFormat = 2;
 u64 IrCacheBuildTag(const Device& device) {
     const std::string text =
-        fmt::format("{}|{}|{}|{}|{}|{}|{}|{}", IrCacheFormat, Common::g_scm_rev, Common::g_scm_desc,
-                    sizeof(Shader::Info), sizeof(Shader::IR::Inst),
+        fmt::format("{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}", IrCacheFormat, Common::g_scm_rev,
+                    Common::g_scm_desc, sizeof(Shader::Info), sizeof(Shader::IR::Inst),
                     static_cast<u32>(device.GetDriverID()), device.GetDriverVersion(),
-                    device.GetModelName());
+                    device.GetModelName(),
+                    // TranslateProgram's rescaling pass bakes these into the IR
+                    Settings::values.resolution_info.active ? 1 : 0,
+                    Settings::values.resolution_info.up_scale,
+                    Settings::values.resolution_info.down_shift);
     return Common::CityHash64(text.data(), text.size());
 }
 
@@ -359,6 +364,8 @@ GraphicsPipelineCacheKey PipelineCache::GplDefaultKey(Shader::Stage stage) const
 // --- members called from hooks in vk_pipeline_cache.cpp ---------------------------------------
 
 void PipelineCache::Nx2OpenStageCache(const std::filesystem::path& base_dir) {
+    // A precompile of the previous title must not write into the file opened next.
+    Nx2StopPrecompile();
         // Per-stage translation cache: used when the file exists (a precompile made it);
     // EDEN_NX2_IR_CACHE=0 ignores it. EDEN_NX2_PRECOMPILE=<pack> creates and fills it.
     const char* const pack = std::getenv("EDEN_NX2_PRECOMPILE");

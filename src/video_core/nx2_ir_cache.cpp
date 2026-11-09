@@ -601,6 +601,12 @@ bool StageCache::Open(const std::filesystem::path& path_, u64 build_tag, bool cr
             return false;
         }
     }
+    // Open again for another title (LoadDiskResources runs once per game): an open stream would
+    // fail to open and leave the cache off.
+    if (file.is_open()) {
+        file.close();
+    }
+    file.clear();
     file.open(path, std::ios::binary | std::ios::in | std::ios::out);
     if (!file) {
         return false;

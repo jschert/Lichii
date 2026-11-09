@@ -139,9 +139,12 @@ GplPreRasterState MakeGplPreRasterState(const Device& device, const FixedPipelin
                                         std::span<const u32> spirv);
 GplFragmentState MakeGplFragmentState(const Device& device, const FixedPipelineState& state,
                                       std::span<const u32> spirv, bool fragment_writes_color0);
+/// `color_output_mask`: the fragment stage's written components, 4 bits per render target (the
+/// static write masks leave the others alone, as the monolithic path does).
 GplFragmentOutputState MakeGplFragmentOutputState(const Device& device,
                                                   const FixedPipelineState& state,
-                                                  bool fragment_writes_color0);
+                                                  bool fragment_writes_color0,
+                                                  u32 color_output_mask = ~0U);
 
 /// Descriptor set layout of one stage's resources (null when it has none), binding numbers from 0
 /// in DescriptorLayoutBuilder order, as the stage's library SPIR-V declares them.

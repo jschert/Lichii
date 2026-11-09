@@ -1588,13 +1588,15 @@ void Device::RemoveUnsuitableExtensions() {
     {
         const char* const gpl_env = std::getenv("EDEN_NX2_GPL");
         const bool wanted = gpl_env != nullptr && gpl_env[0] == '1';
-        const bool usable = wanted && extensions.pipeline_library &&
+        // Not on tilers: their multisampled framebuffers resolve in a render pass (MSAA tiler
+        // resolve), which the library path's dynamic rendering doesn't do.
+        const bool usable = wanted && !IsTiler() && extensions.pipeline_library &&
                             features.graphics_pipeline_library.graphicsPipelineLibrary &&
                             properties.graphics_pipeline_library.graphicsPipelineLibraryFastLinking &&
                             features.dynamic_rendering.dynamicRendering;
         if (wanted && !usable) {
             LOG_WARNING(Render_Vulkan, "EDEN_NX2_GPL: the device lacks graphics pipeline libraries "
-                                       "with fast linking or dynamic rendering");
+                                       "with fast linking or dynamic rendering, or is a tiler");
         }
         extensions.graphics_pipeline_library = usable;
         RemoveExtensionFeatureIfUnsuitable(extensions.graphics_pipeline_library,

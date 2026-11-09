@@ -30,7 +30,8 @@ void GraphicsPipeline::Nx2InitLibraryPipeline(const GplParams& gpl, DescriptorPo
     gpl_pr = MakeGplPreRasterState(device, key.state, gpl.vertex_spirv);
     gpl_fs = MakeGplFragmentState(device, key.state, gpl.fragment_spirv,
                                   fragment_has_color0_output);
-    gpl_fo = MakeGplFragmentOutputState(device, key.state, fragment_has_color0_output);
+    gpl_fo = MakeGplFragmentOutputState(device, key.state, fragment_has_color0_output,
+                                        color_output_mask);
     lto_control = std::make_shared<LtoControl>();
     SetupGplDescriptors(descriptor_pool);
 }

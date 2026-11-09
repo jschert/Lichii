@@ -209,6 +209,13 @@ Shader::TextureType PrecompileEnvironment::ReadTextureType(u32 handle) {
 }
 
 Shader::TexturePixelFormat PrecompileEnvironment::ReadTexturePixelFormat(u32 handle) {
+    // An exact-format read (byte-addressed image stores, SNORM buffer fetches): the record is
+    // only used where the live texture has this format (kind 2, as live translations log it).
+    if (!has_handle_source) {
+        throw Shader::RuntimeError("Texture format query without a handle source");
+    }
+    texture_queries.push_back(
+        {last_handle_source, 2, static_cast<u32>(Shader::TexturePixelFormat::A8B8G8R8_UNORM)});
     texture_pixel_formats.emplace(handle, Shader::TexturePixelFormat::A8B8G8R8_UNORM);
     return Shader::TexturePixelFormat::A8B8G8R8_UNORM;
 }
@@ -217,9 +224,11 @@ bool PrecompileEnvironment::IsTexturePixelFormatInteger(u32 handle) {
     if (!has_handle_source) {
         throw Shader::RuntimeError("Texture format query without a handle source");
     }
+    // Only whether it is an integer format: checked as such (kind 1), not as the exact format.
     texture_queries.push_back({last_handle_source, 1, 0});
+    texture_pixel_formats.emplace(handle, Shader::TexturePixelFormat::A8B8G8R8_UNORM);
     return VideoCore::Surface::IsPixelFormatInteger(
-        static_cast<VideoCore::Surface::PixelFormat>(ReadTexturePixelFormat(handle)));
+        static_cast<VideoCore::Surface::PixelFormat>(Shader::TexturePixelFormat::A8B8G8R8_UNORM));
 }
 
 u32 PrecompileEnvironment::ReadViewportTransformState() {

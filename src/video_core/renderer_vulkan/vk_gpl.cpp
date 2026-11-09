@@ -293,7 +293,8 @@ GplFragmentState MakeGplFragmentState(const Device& device, const FixedPipelineS
 
 GplFragmentOutputState MakeGplFragmentOutputState(const Device& device,
                                                   const FixedPipelineState& state,
-                                                  bool fragment_writes_color0) {
+                                                  bool fragment_writes_color0,
+                                                  u32 color_output_mask) {
     using VideoCore::Surface::PixelFormatFromDepthFormat;
     using VideoCore::Surface::PixelFormatFromRenderTargetFormat;
     GplFragmentOutputState fo{};
@@ -351,6 +352,9 @@ GplFragmentOutputState MakeGplFragmentOutputState(const Device& device,
         for (size_t i = 0; i < mask_table.size(); ++i) {
             write_mask |= mask[i] ? mask_table[i] : 0;
         }
+        // Components the fragment stage doesn't write stay untouched in the guest; Vulkan would
+        // write undefined values to them (AMD writes garbage).
+        write_mask &= (color_output_mask >> (index * 4)) & 0xF;
         fo.attachments[index] = {
             blend.enable != 0 ? 1u : 0u,
             static_cast<u32>(MaxwellToVK::BlendFactor(blend.SourceRGBFactor())),

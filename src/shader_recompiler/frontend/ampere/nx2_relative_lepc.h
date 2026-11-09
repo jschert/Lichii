@@ -56,7 +56,11 @@ template <typename Insn>
                                         (base >= 0x185 && base <= 0x188) ||
                                         base == 0x18e || op == 0x918 || op == 0x357 ||
                                         op == 0x957;
-            if (n.Bits(16, 8) == reg && !no_destination) written[r] = true;
+            // Only an unconditional write (guard PT, bits 12-15 == 7) replaces the address on
+            // every lane; a predicated one may leave it.
+            if (n.Bits(16, 8) == reg && !no_destination && n.Bits(12, 4) == 7) {
+                written[r] = true;
+            }
         }
         if (written[0] && written[1]) return true;
     }
