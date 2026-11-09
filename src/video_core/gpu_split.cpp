@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <thread>
 
@@ -116,6 +117,9 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     }
     system = &system_;
     check_owner = std::getenv("EDEN_NX2_SPLIT_CHECK") != nullptr;
+    const char* const verify = std::getenv("EDEN_NX2_ACQUIRE_VERIFY");
+    g_acquire_verify = verify != nullptr && verify[0] == '1';
+    g_acquire_counting = g_acquire_verify || Nx2Profile::Enabled();
     ring = std::make_unique<u64[]>(RingWords);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
@@ -143,6 +147,11 @@ void GpuSplit::Stop() {
     write_position = 0;
     last_writer_position = 0;
     last_sync_position = 0;
+    semaphore_writes.clear();
+    semaphore_writes_limit = 1024;
+    last_any_write = 0;
+    last_noted_write = 0;
+    write_positions.fill(0);
     published_local = 0;
     consumed_cache = 0;
     publish_every = PublishEvery;
@@ -151,6 +160,7 @@ void GpuSplit::Stop() {
     front_macros = false;
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
+    back_idle_at.store(~u64{0}, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
     front_waiting.store(false, std::memory_order_relaxed);
 }
@@ -175,9 +185,11 @@ void GpuSplit::WaitForSpace(size_t words) {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (write_position + words - consumed_cache <= RingWords) {
+            Nx2Profile::AddDrain(DrainSite::RingFull, start);
             return;
         }
         if (spins < 4096) {
@@ -203,18 +215,34 @@ void GpuSplit::Publish() {
 
 void GpuSplit::Drain(DrainSite site) {
     consumed_cache = consumed.load(std::memory_order_acquire);
-    if (consumed_cache == write_position) {
+    if (consumed_cache == write_position && BackQuiet()) {
         return;
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
+    // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
+    // from its idle hook afterwards, and the caller may use the scheduler once this returns.
+    bool hook_asked = false;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
-            publish_every = 8;
-            Nx2Profile::AddDrain(site, start);
-            return;
+            if (BackQuiet()) {
+                publish_every = 8;
+                Nx2Profile::AddDrain(site, start);
+                return;
+            }
+            if (!hook_asked) {
+                RequestIdleHook();
+                hook_asked = true;
+            }
+            // Backoff sleeps only while entries are unconsumed: spin until the hook is done.
+            if (spins < 16384) {
+                Pause();
+            } else {
+                std::this_thread::yield();
+            }
+            continue;
         }
         Backoff(spins, write_position);
     }
@@ -226,6 +254,90 @@ bool GpuSplit::WaitForWriters() {
 
 bool GpuSplit::WaitForSync() {
     return WaitFor(std::min(last_sync_position, write_position), DrainSite::ListSync);
+}
+
+void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known) {
+    if (semaphore_writes.size() >= semaphore_writes_limit) {
+        // The words of releases the back ran hold their values in memory.
+        const u64 done = consumed.load(std::memory_order_acquire);
+        std::erase_if(semaphore_writes,
+                      [done](const auto& entry) { return entry.second.position <= done; });
+        semaphore_writes_limit = std::max<size_t>(1024, semaphore_writes.size() * 2);
+    }
+    semaphore_writes.insert_or_assign(device_address & ~u64{3},
+                                      SemaphoreWrite{write_position, payload, known});
+}
+
+std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
+    u64 device_address) const {
+    const auto it = semaphore_writes.find(device_address & ~u64{3});
+    if (it == semaphore_writes.end() ||
+        it->second.position <= consumed.load(std::memory_order_acquire)) {
+        return std::nullopt;
+    }
+    return QueuedSemaphoreWrite{it->second.payload, it->second.known};
+}
+
+namespace {
+
+/// Calls `func(device_address, size)` for each mapped piece of [address, address + size) within
+/// one 4 KiB GPU page; nothing is read or written where no device memory is mapped.
+template <typename Func>
+void ForEachDeviceRange(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
+                        Func&& func) {
+    constexpr GPUVAddr page_size = 0x1000;
+    const GPUVAddr end = address + size;
+    for (GPUVAddr begin = address; begin < end;) {
+        const GPUVAddr page_end = std::min((begin & ~(page_size - 1)) + page_size, end);
+        if (const auto device = memory.GpuToCpuAddress(begin)) {
+            func(*device, page_end - begin);
+        }
+        begin = page_end;
+    }
+}
+
+} // Anonymous namespace
+
+void GpuSplit::NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) {
+    if (size > MaxNotedBytes || address + size < address) {
+        NoteAnyWrite();
+        return;
+    }
+    ForEachDeviceRange(memory, address, size,
+                       [this](DAddr device, u64 bytes) { NoteDeviceWrite(device, bytes); });
+}
+
+void GpuSplit::NoteDeviceWrite(DAddr address, u64 size) {
+    const u64 last = (address + size - 1) >> WriteGranuleBits;
+    for (u64 granule = address >> WriteGranuleBits; granule <= last; ++granule) {
+        write_positions[WriteSlot(granule)] = write_position;
+    }
+    last_noted_write = write_position;
+}
+
+u64 GpuSplit::WritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) const {
+    if (size > MaxNotedBytes || address + size < address) {
+        return std::max(last_any_write, last_noted_write);
+    }
+    u64 target = last_any_write;
+    ForEachDeviceRange(memory, address, size, [this, &target](DAddr device, u64 bytes) {
+        target = std::max(target, DeviceWritesTarget(device, bytes));
+    });
+    return target;
+}
+
+u64 GpuSplit::DeviceWritesTarget(DAddr address, u64 size) const {
+    u64 target = 0;
+    const u64 last = (address + size - 1) >> WriteGranuleBits;
+    for (u64 granule = address >> WriteGranuleBits; granule <= last; ++granule) {
+        target = std::max(target, write_positions[WriteSlot(granule)]);
+    }
+    return target;
+}
+
+bool GpuSplit::WaitForWrites(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) {
+    return WaitFor(std::min(WritesTarget(memory, address, size), write_position),
+                   DrainSite::MacroDmaWrites);
 }
 
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {
@@ -276,7 +388,8 @@ void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
 }
 
 void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
-                           u32 amount, u32 methods_pending, const GPUVAddr* segment) {
+                           u32 amount, u32 methods_pending, const GPUVAddr* segment,
+                           Writes writes) {
     SelectEngine(engine);
     // Long runs (constant buffer and inline uploads) go in pieces, as when a method's data
     // continues in the next GPFIFO entry.
@@ -297,6 +410,9 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
         words += piece;
         amount -= piece;
         methods_pending -= piece;
+    }
+    if (writes == Writes::Anywhere) {
+        NoteAnyWrite();
     }
 }
 
@@ -418,6 +534,7 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
 
 void GpuSplit::BackLoop(std::stop_token stop_token) {
     const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuBack};
+    const StutterTrace::ThreadScope stutter_thread{StutterTrace::Thread::Back};
     Common::SetCurrentThreadName("GPUBack");
     on_back_thread = true;
     back_running.store(true, std::memory_order_release);
@@ -432,10 +549,14 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
 #endif
     u64 read_position = 0;
     while (!stop_token.stop_requested()) {
-        Nx2Profile::Report("GPU back thread");
+        Nx2Profile::Report("GPU back thread", true);
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
+            // The front publishes what it holds after a few more words from now on.
+            back_idle_at.store(read_position, std::memory_order_relaxed);
+            const auto spin_start = g_acquire_counting ? std::chrono::steady_clock::now()
+                                                       : std::chrono::steady_clock::time_point{};
             // The front usually sends more within microseconds: spin briefly before sleeping.
             for (u32 spins = 0; spins < 8192 && available == read_position &&
                                 !hook_requested.load(std::memory_order_relaxed);
@@ -443,9 +564,23 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 Pause();
                 available = published.load(std::memory_order_acquire);
             }
-            if (available == read_position && idle_hook != nullptr) {
+            if (g_acquire_counting) {
+                Count(g_acquire_stats.back_waits);
+                Count(g_acquire_stats.back_spin_ns,
+                      static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now() - spin_start)
+                                           .count()));
+            }
+            if (available == read_position) {
                 hook_requested.store(false, std::memory_order_seq_cst);
-                idle_hook(idle_argument);
+                // The front may already see everything consumed: Drain() waits for back_quiet
+                // too, so the deferred submit can't overlap whatever the front does next.
+                if (!back_quiet.load(std::memory_order_relaxed)) {
+                    if (idle_hook != nullptr) {
+                        idle_hook(idle_argument);
+                    }
+                    back_quiet.store(true, std::memory_order_release);
+                }
                 available = published.load(std::memory_order_acquire);
             }
             if (available == read_position) {
@@ -457,6 +592,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 // A request made after the hook ran (RequestIdleHook) runs it before sleeping.
                 if (available == read_position && !stop_token.stop_requested() &&
                     !hook_requested.load(std::memory_order_seq_cst)) {
+                    Count(g_acquire_stats.back_sleeps);
                     wake.wait(seen, std::memory_order_seq_cst);
                 }
                 back_waiting.store(false, std::memory_order_relaxed);
@@ -464,6 +600,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
         }
         u64 last_store = read_position;
+        // Before any entry runs, so a front that sees these entries consumed also sees this.
+        back_quiet.store(false, std::memory_order_seq_cst);
         while (read_position != available) {
             const size_t index = read_position & RingMask;
             const size_t size =
@@ -490,6 +628,60 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     back_running.store(false, std::memory_order_seq_cst);
     front_wake.fetch_add(1, std::memory_order_seq_cst);
     front_wake.notify_all();
+}
+
+void GpuSplit::ReportAcquire() {
+    static u32 calls{};
+    static auto next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    if (++calls % 256 != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next) {
+        return;
+    }
+    next = now + std::chrono::seconds{10};
+    auto& stats = g_acquire_stats;
+    const auto take = [](std::atomic<u64>& counter) {
+        return counter.exchange(0, std::memory_order_relaxed);
+    };
+    const u64 passed = take(stats.passed);
+    const u64 by_queued = take(stats.by_queued);
+    const u64 latched = take(stats.latched);
+    const u64 drained = take(stats.drained);
+    const u64 drain_operation = take(stats.drain_operation);
+    const u64 drain_settings = take(stats.drain_settings);
+    const u64 drain_word = take(stats.drain_word);
+    const u64 drain_queued = take(stats.drain_queued);
+    const u64 valve_drains = take(stats.valve_drains);
+    const u64 polls = take(stats.polls);
+    const u64 acquire_polls = take(stats.acquire_polls);
+    const u64 list_polls = take(stats.list_polls);
+    const u64 early_publishes = take(stats.early_publishes);
+    const u64 settles = take(stats.settles);
+    const u64 back_waits = take(stats.back_waits);
+    const u64 back_sleeps = take(stats.back_sleeps);
+    const double spin_ms = static_cast<double>(take(stats.back_spin_ns)) / 1e6;
+    LOG_INFO(HW_GPU,
+             "Acquires: {} passed without a drain ({} by a queued release), {} resumed by a "
+             "latch, {} drained ({} by the 1 ms valve; {} equal or mask, {} by the settings, {} "
+             "unmapped or GPU-written word, {} queued release unknown or short), {} polls waited "
+             "without a drain in 10 s; polls: {} of acquires, {} of GPU-written list copies; "
+             "back: {} waits for work, {} slept, {:.1f} ms spinning; {} early publishes, {} idle "
+             "hooks asked by polls",
+             passed, by_queued, latched, drained, valve_drains, drain_operation, drain_settings,
+             drain_word, drain_queued, polls, acquire_polls, list_polls, back_waits, back_sleeps,
+             spin_ms, early_publishes, settles);
+    const u64 mismatches = take(stats.mismatches);
+    const u64 unlanded = take(stats.unlanded);
+    const u64 late = take(stats.late);
+    if (mismatches != 0 || unlanded != 0 || late != 0) {
+        LOG_WARNING(HW_GPU,
+                    "Acquire verify: {} passed but not met after a drain, {} met by a "
+                    "queued release not in memory after it, {} polls waited though a drain meets "
+                    "them, in 10 s",
+                    mismatches, unlanded, late);
+    }
 }
 
 } // namespace VideoCommon

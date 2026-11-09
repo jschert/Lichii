@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstring>
 #include <iterator>
+#include <span>
 #include <utility>
 
 #include "common/logging.h"
@@ -43,29 +44,39 @@ PartitionFilesystem::PartitionFilesystem(VirtualFile file) {
 
     is_hfs = pfs_header.magic == Common::MakeMagic('H', 'F', 'S', '0');
 
-    std::size_t entry_size = is_hfs ? sizeof(HFSEntry) : sizeof(PFSEntry);
-    std::size_t metadata_size =
+    const u64 entry_size = is_hfs ? sizeof(HFSEntry) : sizeof(PFSEntry);
+    const u64 metadata_size =
         sizeof(Header) + (pfs_header.num_entries * entry_size) + pfs_header.strtab_size;
-
-    // Actually read in now...
-    std::vector<u8> file_data = file->ReadBytes(metadata_size);
-    const std::size_t total_size = file_data.size();
-    file_data.push_back(0);
-
-    if (total_size != metadata_size) {
+    if (metadata_size > file->GetSize()) {
         status = Loader::ResultStatus::ErrorIncorrectPFSFileSize;
         return;
     }
 
-    std::size_t entries_offset = sizeof(Header);
-    std::size_t strtab_offset = entries_offset + (pfs_header.num_entries * entry_size);
+    // Actually read in now...
+    const std::vector<u8> file_data = file->ReadBytes(metadata_size);
+    if (file_data.size() != metadata_size) {
+        status = Loader::ResultStatus::ErrorIncorrectPFSFileSize;
+        return;
+    }
+
+    const std::size_t entries_offset = sizeof(Header);
+    const std::size_t strtab_offset = entries_offset + (pfs_header.num_entries * entry_size);
+    const std::span<const char> strtab{
+        reinterpret_cast<const char*>(file_data.data()) + strtab_offset, pfs_header.strtab_size};
     content_offset = strtab_offset + pfs_header.strtab_size;
-    for (u16 i = 0; i < pfs_header.num_entries; i++) {
+    for (u32 i = 0; i < pfs_header.num_entries; i++) {
         FSEntry entry;
 
         memcpy(&entry, &file_data[entries_offset + (i * entry_size)], sizeof(FSEntry));
-        std::string name(
-            reinterpret_cast<const char*>(&file_data[strtab_offset + entry.strtab_offset]));
+        if (entry.strtab_offset >= strtab.size()) {
+            offsets.clear();
+            sizes.clear();
+            pfs_files.clear();
+            status = Loader::ResultStatus::ErrorBadPFSHeader;
+            return;
+        }
+        const auto name_bytes = strtab.subspan(entry.strtab_offset);
+        std::string name(name_bytes.data(), strnlen(name_bytes.data(), name_bytes.size()));
 
         offsets.insert_or_assign(name, content_offset + entry.offset);
         sizes.insert_or_assign(name, entry.size);

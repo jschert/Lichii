@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <thread>
 
@@ -12,6 +13,21 @@
 #endif
 
 namespace Common {
+
+/// EDEN_NX2_GPU_PROFILE: contended SpinRecursiveMutex acquisitions, their wait and how many slept.
+struct SpinMutexContention {
+    std::uint64_t count{};
+    std::uint64_t ns{};
+    std::uint64_t sleeps{};
+};
+struct SharedSpinMutexContention {
+    std::atomic<std::uint64_t> count{};
+    std::atomic<std::uint64_t> ns{};
+    std::atomic<std::uint64_t> sleeps{};
+};
+inline bool g_count_spin_contention{};
+inline thread_local SpinMutexContention t_spin_contention{};
+inline SharedSpinMutexContention g_spin_contention{};
 
 /// A recursive mutex that spins briefly before sleeping. The GPU caches' locks are taken tens of
 /// thousands of times a second by the GPU thread, the fencing thread and CPU write traps, and
@@ -73,13 +89,33 @@ private:
     }
 
     void LockContended() {
+        if (g_count_spin_contention) {
+            const auto start = std::chrono::steady_clock::now();
+            const bool slept = Acquire();
+            const auto ns = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count());
+            ++t_spin_contention.count;
+            t_spin_contention.ns += ns;
+            t_spin_contention.sleeps += slept ? 1 : 0;
+            g_spin_contention.count.fetch_add(1, std::memory_order_relaxed);
+            g_spin_contention.ns.fetch_add(ns, std::memory_order_relaxed);
+            g_spin_contention.sleeps.fetch_add(slept ? 1 : 0, std::memory_order_relaxed);
+            return;
+        }
+        Acquire();
+    }
+
+    /// Returns whether it slept.
+    bool Acquire() {
         for (int spin = 0; spin < SpinCount; ++spin) {
             Pause();
             if (state.load(std::memory_order_relaxed) == 0) {
                 std::uint32_t expected = 0;
                 if (state.compare_exchange_weak(expected, 1, std::memory_order_acquire,
                                                 std::memory_order_relaxed)) {
-                    return;
+                    return false;
                 }
             }
         }
@@ -88,6 +124,7 @@ private:
         while (state.exchange(2, std::memory_order_acquire) != 0) {
             state.wait(2, std::memory_order_relaxed);
         }
+        return true;
     }
 
     std::atomic<std::uint32_t> state{0}; ///< 0 free, 1 held, 2 held with sleepers

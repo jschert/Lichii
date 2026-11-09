@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstdlib>
 #include <cstdio>
 #include <span>
@@ -22,6 +23,7 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
@@ -58,8 +60,10 @@ DmaPusher::~DmaPusher() = default;
 
 bool DmaPusher::CanResumeAcquire() {
     if (pending_list_tick) {
+        VideoCommon::Count(VideoCommon::g_acquire_stats.list_polls);
         return rasterizer->IsGpuTickDone(*pending_list_tick);
     }
+    VideoCommon::Count(VideoCommon::g_acquire_stats.acquire_polls);
     return puller.CanResumeAcquire(*this);
 }
 
@@ -82,6 +86,55 @@ void DmaPusher::DispatchCalls() {
     system.GPU().FlushCommands();
     system.GPU().OnCommandListEnd();
 }
+
+namespace {
+
+enum class LiveReadReason : u32 {
+    Resumed,
+    SuspendedCopy,
+    SuspensionsChanged,
+    GpuWritten,
+    SafeDirty,
+    Count,
+};
+
+/// EDEN_NX2_LIVE_READ_CHECK: compares the words an entry was parsed from with its submit-time copy.
+void CheckLiveRead(LiveReadReason reason, const CommandListHeader& header,
+                   std::span<const CommandHeader> parsed, const CommandHeader* copy) {
+    constexpr size_t count = static_cast<size_t>(LiveReadReason::Count);
+    static std::array<std::atomic<u64>, count> checked{};
+    static std::array<std::atomic<u64>, count> differing{};
+    static std::atomic<u64> total_checked{};
+    static constexpr std::array<const char*, count> names{
+        "resumed entry", "copied during a suspension", "suspension count changed",
+        "GPU-written page", "safe read of dirty memory"};
+    const size_t r = static_cast<size_t>(reason);
+    u32 first = ~0U, words = 0;
+    for (u32 i = 0; i < parsed.size(); ++i) {
+        if (copy[i].argument != parsed[i].argument) {
+            first = std::min(first, i);
+            ++words;
+        }
+    }
+    ++checked[r];
+    const u64 n = total_checked.fetch_add(1) + 1;
+    if (words != 0 && differing[r].fetch_add(1) < 4) {
+        LOG_WARNING(HW_GPU,
+                    "Entry {:#x}+{:#x} parsed from memory ({}) differs from its submit-time copy "
+                    "in {} words, first at word {}",
+                    u64{header.addr}, u64{header.size}, names[r], words, first);
+    }
+    if ((n % 10000) == 0) {
+        for (size_t i = 0; i < count; ++i) {
+            LOG_INFO(HW_GPU,
+                     "Entries parsed from memory ({}): {} checked, {} differ from the "
+                     "submit-time copy",
+                     names[i], checked[i].load(), differing[i].load());
+        }
+    }
+}
+
+} // Anonymous namespace
 
 bool DmaPusher::Step() {
     if (!ib_enable || dma_pushbuffer.empty()) {
@@ -236,6 +289,27 @@ bool DmaPusher::Step() {
             gpu_written,
             use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
                                                      header.size * sizeof(u32)));
+        // An entry parsed from memory instead of its submit-time copy is the way a command
+        // ring the game already refilled gets read as this frame's commands (garbage methods,
+        // unbound subchannels, render targets of absurd size). EDEN_NX2_LIVE_READ_CHECK counts
+        // how often the words parsed differ from the copy, by the reason the copy was skipped.
+        static const bool live_read_check = std::getenv("EDEN_NX2_LIVE_READ_CHECK") != nullptr;
+        const CommandHeader* const submitted_copy =
+            live_read_check && !submitted &&
+                    dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
+                    !std::ranges::binary_search(command_list.deferred_entries,
+                                                static_cast<u32>(dma_pushbuffer_subindex))
+                ? command_list.submitted_words.data() +
+                      command_list.submitted_offsets[dma_pushbuffer_subindex]
+                : nullptr;
+        const LiveReadReason live_read_reason =
+            submitted_copy == nullptr                       ? LiveReadReason::Count
+            : command_resume_offset != 0                    ? LiveReadReason::Resumed
+            : (command_list.snapshot_suspensions & 1) != 0  ? LiveReadReason::SuspendedCopy
+            : command_list.snapshot_suspensions != suspensions.load(std::memory_order_acquire)
+                ? LiveReadReason::SuspensionsChanged
+            : gpu_written ? LiveReadReason::GpuWritten
+                          : LiveReadReason::SafeDirty;
         if (submitted) {
             const std::span<const CommandHeader> commands{
                 command_list.submitted_words.data() +
@@ -248,6 +322,9 @@ bool DmaPusher::Step() {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
+            if (submitted_copy != nullptr) {
+                CheckLiveRead(live_read_reason, header, commands, submitted_copy);
+            }
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Safe);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
@@ -261,6 +338,9 @@ bool DmaPusher::Step() {
             }
             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
             RecordParsedEntry(header, commands);
+            if (submitted_copy != nullptr) {
+                CheckLiveRead(live_read_reason, header, commands, submitted_copy);
+            }
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Copy);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
@@ -269,6 +349,9 @@ bool DmaPusher::Step() {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
+            if (submitted_copy != nullptr) {
+                CheckLiveRead(live_read_reason, header, commands, submitted_copy);
+            }
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Slow);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
@@ -517,6 +600,9 @@ void DmaPusher::CallMethod(u32 argument) {
             }
             split.Method(subchannel, dma_state.method, argument, dma_state.is_last_call,
                          WantsSegment() ? &segment : nullptr);
+            if (engine_type == Engines::EngineTypes::MaxwellDMA) {
+                NoteDmaSemaphore(dma_state.method, argument);
+            }
             return;
         }
         if (!subchannel->execution_mask[dma_state.method]) {
@@ -575,12 +661,46 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
             }
             split.MultiMethod(subchannel, dma_state.method, base_start, num_methods,
                               dma_state.method_count, WantsSegment() ? &segment : nullptr);
+            if (engine_type == Engines::EngineTypes::MaxwellDMA) {
+                for (u32 i = 0; i < num_methods; ++i) {
+                    NoteDmaSemaphore(dma_state.method, base_start[i]);
+                }
+            }
             return;
         }
         VideoCommon::Nx2Profile::Scope method_scope{VideoCommon::Nx2Profile::Zone::Method};
         subchannel->ConsumeSink(system);
         subchannel->current_dma_segment = dma_state.dma_get + dma_state.dma_word_offset;
         subchannel->CallMultiMethod(system, dma_state.method, base_start, num_methods, dma_state.method_count);
+    }
+}
+
+void DmaPusher::NoteDmaSemaphore(u32 method, u32 argument) {
+    using Engines::MaxwellDMA;
+    if (method >= MaxwellDMA::SemaphoreMethod && method < MaxwellDMA::SemaphoreMethod + 3) {
+        dma_semaphore[method - MaxwellDMA::SemaphoreMethod] = argument;
+        return;
+    }
+    if (method != MaxwellDMA::LaunchDmaMethod) {
+        return;
+    }
+    // As MaxwellDMA::ReleaseSemaphore writes it.
+    using SemaphoreType = MaxwellDMA::LaunchDMA::SemaphoreType;
+    const auto type = std::bit_cast<MaxwellDMA::LaunchDMA>(argument).semaphore_type.Value();
+    if (type != SemaphoreType::RELEASE_ONE_WORD_SEMAPHORE &&
+        type != SemaphoreType::RELEASE_FOUR_WORD_SEMAPHORE) {
+        return;
+    }
+    const GPUVAddr address = MaxwellDMA::PackedGPUVAddr{dma_semaphore[0], dma_semaphore[1]};
+    const auto device = memory_manager.GpuToCpuAddress(address);
+    if (!device) {
+        return;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    split.NoteSemaphoreWrite(*device, dma_semaphore[2], true);
+    if (type == SemaphoreType::RELEASE_FOUR_WORD_SEMAPHORE) {
+        // The payload as 64 bits (a timestamp follows).
+        split.NoteSemaphoreWrite(*device + 4, 0, true);
     }
 }
 

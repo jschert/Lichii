@@ -311,7 +311,7 @@ class CliTests(unittest.TestCase):
 
     def test_both_cache_versions_all_stages(self):
         """Validate ordinary stage output for each supported cache version."""
-        for version in (46, 47, 48, 49, 50, 51, 52, 53):
+        for version in range(46, 55):
             for stage, name in enumerate(STAGES):
                 with self.subTest(version=version, stage=name):
                     capture = self.write("shader.env", environment(version, stage))
@@ -368,6 +368,10 @@ class CliTests(unittest.TestCase):
             self.run_cli(source, "--lower-only", self.output, code=2)
         capture = self.write("shader.env", environment(46, 5))
         self.run_cli("--environment", capture, "--cache-version", 50, "--output", self.output, code=2)
+        for version in ("45", "55", "5x", "054"):
+            result = self.run_cli("--environment", capture, "--cache-version", version,
+                                  "--output", self.output, code=2)
+            self.assertEqual(result["error"]["message"], "Expected cache version 46 to 54")
         source = self.write("native.bin", bytes(16))
         result = self.run_cli(source, "--lower-only", self.output, code=1)
         self.assertEqual(result["phase"], "lower")

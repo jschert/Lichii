@@ -13,6 +13,7 @@ This contains documentation created by developers, build instructions, guideline
 - **[Dependencies](./Deps.md)**
 - **[Debug Guidelines](./Debug.md)**
   - **[RenderDoc](./Debug.md#renderdoc)**
+- **[Fuzzing the game-file parsers](./Fuzzing.md)**
 - **[CPM - CMake Package Manager](./CPMUtil.md)**
 - **[Platform-Specific Caveats](./Caveats.md)**
 - **[The NVIDIA SM86 (Maxwell) GPU](./NvidiaGpu.md)**

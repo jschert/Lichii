@@ -32,7 +32,10 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/shader_cache.h"
+#include "video_core/shader_cache_v2/cache.h"
+#include "video_core/shader_cache_v2/records.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/renderer_vulkan/nx2_pipeline_stats.h"
@@ -172,7 +175,9 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                 // ShaderInfo keeps the result for the pipeline's environments).
                 RethrowIfRejected(*cpu_shader_addr);
                 const auto lower_begin = Vulkan::Nx2Stats::Clock::now();
-                GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address};
+                const Nx2Profile::Scope profile_scope{Nx2Profile::Zone::ShaderCapture};
+                GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address,
+                                        {}, shader_cache_v2};
                 shader_info = MakeShaderInfo(env, *cpu_shader_addr);
                 if (Vulkan::Nx2Stats::Enabled()) {
                     const auto lower_time = Vulkan::Nx2Stats::Clock::now() - lower_begin;
@@ -290,7 +295,9 @@ const ShaderInfo* ShaderCache::ComputeShader() {
     } else {
         try {
             RethrowIfRejected(*cpu_shader_addr);
-            ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
+            const Nx2Profile::Scope profile_scope{Nx2Profile::Zone::ShaderCapture};
+            ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start, {},
+                                   shader_cache_v2};
             shader = MakeShaderInfo(env, *cpu_shader_addr);
         } catch (const Shader::Ampere::TrapGuardError&) {
             // Constants can become valid on the next dispatch; do not cache this rejection.
@@ -512,6 +519,9 @@ const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu
         info->size_bytes = env.ReadSizeBytes();
     }
     info->lowered_native = env.LoweredNative();
+    if (const auto record = env.TakeProgramRecord(); record && shader_cache_v2) {
+        shader_cache_v2->RecordProgram(*record);
+    }
     const size_t size_bytes{env.SourceSizeBytes() ? env.SourceSizeBytes() : info->size_bytes};
     const ShaderInfo* const result{info.get()};
     Register(std::move(info), cpu_addr, size_bytes);

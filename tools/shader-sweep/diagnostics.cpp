@@ -14,6 +14,9 @@ void AssertFatalImpl() {
     throw std::runtime_error("Shader compiler reached an unreachable path");
 }
 
+// With the v2 cache linked in, common's logger is linked as well and messages are dropped: it is
+// never started.
+#ifndef SHADER_SWEEP_V2
 namespace Common::Log {
 void FmtLogMessageImpl(Class, Level level, const char* filename, unsigned int line,
                        const char* function, fmt::string_view format,
@@ -26,3 +29,4 @@ void FmtLogMessageImpl(Class, Level level, const char* filename, unsigned int li
         throw std::runtime_error(message);
 }
 } // namespace Common::Log
+#endif

@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <span>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -13,6 +14,13 @@
 #include "video_core/shader_environment.h"
 
 namespace Vulkan {
+
+// <title>/vulkan_used.bin: the graphics pipelines recent sessions used, as key hash + sessions
+// since the last use.
+constexpr u32 UsedPipelinesMagic = 0x31505545; // "EUP1"
+
+/// Reads a used list, without the pipelines last used `max_age` or more sessions ago
+std::unordered_map<u64, u8> LoadUsedPipelines(const std::filesystem::path& path, u8 max_age);
 
 /// A compute translation read from the disk cache, and where it is in the file
 struct CachedComputeTranslation {

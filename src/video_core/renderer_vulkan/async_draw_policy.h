@@ -53,10 +53,4 @@ constexpr NativeDrawAction DecideNativePending(NativePendingMode mode, bool can_
     return NativeDrawAction::WaitTimed;
 }
 
-/// Whether a native pipeline's SPIR-V emission is deferred to a worker: only while fewer than
-/// `capacity` emissions are pending.
-constexpr bool DefersShaderEmission(bool native, size_t pending, size_t capacity) {
-    return native && pending < capacity;
-}
-
 } // namespace Vulkan

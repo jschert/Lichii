@@ -78,6 +78,9 @@ struct NcaHeader {
     static constexpr u32 Magic1 = Common::MakeMagic('N', 'C', 'A', '1');
     static constexpr u32 Magic2 = Common::MakeMagic('N', 'C', 'A', '2');
     static constexpr u32 Magic3 = Common::MakeMagic('N', 'C', 'A', '3');
+    // An NCA3 stored with a plaintext header and plaintext sections (every FS encryption type
+    // None), as produced by game converters and stored in NX archives.
+    static constexpr u32 MagicDecrypted = Common::MakeMagic('D', 'N', 'C', 'A');
 
     static constexpr u32 Magic = Magic3;
 
@@ -306,19 +309,24 @@ struct NcaFsHeader {
     Result GetHashTargetOffset(s64* out) const {
         switch (this->hash_type) {
         case HashType::HierarchicalIntegrityHash:
-        case HashType::HierarchicalIntegritySha3Hash:
-            *out = this->hash_data.integrity_meta_info.level_hash_info
-                       .info[this->hash_data.integrity_meta_info.level_hash_info.max_layers - 2]
-                       .offset;
+        case HashType::HierarchicalIntegritySha3Hash: {
+            const auto& level_hash_info = this->hash_data.integrity_meta_info.level_hash_info;
+            R_UNLESS(level_hash_info.max_layers >= 2 &&
+                         level_hash_info.max_layers - 2 < level_hash_info.info.size(),
+                     ResultInvalidNcaFsHeader);
+            *out = level_hash_info.info[level_hash_info.max_layers - 2].offset;
             R_SUCCEED();
+        }
         case HashType::HierarchicalSha256Hash:
-        case HashType::HierarchicalSha3256Hash:
-            *out =
-                this->hash_data.hierarchical_sha256_data
-                    .hash_layer_region[this->hash_data.hierarchical_sha256_data.hash_layer_count -
-                                       1]
-                    .offset;
+        case HashType::HierarchicalSha3256Hash: {
+            const auto& sha256_data = this->hash_data.hierarchical_sha256_data;
+            R_UNLESS(sha256_data.hash_layer_count >= 1 &&
+                         static_cast<size_t>(sha256_data.hash_layer_count) <=
+                             sha256_data.hash_layer_region.size(),
+                     ResultInvalidNcaFsHeader);
+            *out = sha256_data.hash_layer_region[sha256_data.hash_layer_count - 1].offset;
             R_SUCCEED();
+        }
         default:
             R_THROW(ResultInvalidNcaFsHeader);
         }

@@ -73,6 +73,7 @@ struct hash<Vulkan::GraphicsPipelineCacheKey> {
 namespace Vulkan {
 
 class Device;
+class PipelineBinaries;
 class PipelineStatistics;
 class RenderPassCache;
 class RescalingPushConstant;
@@ -117,10 +118,11 @@ class GraphicsPipeline {
 public:
     explicit GraphicsPipeline(
         Scheduler& scheduler, BufferCache& buffer_cache, TextureCache& texture_cache,
-        vk::PipelineCache& pipeline_cache, VideoCore::ShaderNotify* shader_notify,
+        vk::PipelineCache& pipeline_cache, PipelineBinaries* binaries,
+        VideoCore::ShaderNotify* shader_notify,
         const Device& device, DescriptorPool& descriptor_pool,
         GuestDescriptorQueue& guest_descriptor_queue,
-        DescriptorBufferRing& descriptor_buffer_ring, Common::ThreadWorker* worker_thread,
+        DescriptorBufferRing& descriptor_buffer_ring, const PipelineBuildQueue& build_queue,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
@@ -287,6 +289,11 @@ public:
         return build->IsBuilt();
     }
 
+    /// Builds it on this thread, for a pipeline made with PipelineBuildQueue::owner_builds
+    void Build() {
+        build->Build();
+    }
+
     /// Waits up to `timeout` for the build; true when built.
     [[nodiscard]] bool WaitBuilt(std::chrono::microseconds timeout) const {
         return build->WaitFor(timeout);
@@ -338,6 +345,10 @@ public:
         return delta_mismatch;
     }
 
+    /// Whether an image the kept views sample has an upload pending or a newer alias to copy in:
+    /// ConfigureDelta prepares none, Configure does.
+    [[nodiscard]] bool DeltaImagesChange() const noexcept;
+
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
@@ -351,6 +362,8 @@ public:
 private:
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
+
+    void KeepImageDescriptors(size_t stage, size_t first_entry);
 
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
@@ -374,6 +387,7 @@ private:
     TextureCache& texture_cache;
     BufferCache& buffer_cache;
     vk::PipelineCache& pipeline_cache;
+    PipelineBinaries* const binaries; ///< Shader cache v2's driver layer, else null
     Scheduler& scheduler;
     GuestDescriptorQueue& guest_descriptor_queue;
     DescriptorBufferRing& descriptor_buffer_ring;
@@ -412,6 +426,14 @@ private:
     std::array<u32, NUM_STAGES> handle_constant_buffers{};
     std::vector<VideoCommon::ImageViewInOut> delta_views;
     std::vector<VideoCommon::SamplerId> delta_samplers;
+    /// Delta draws: the image descriptor entries (first entry and count per
+    /// stage) and rescaling words pushed for delta_views, which delta draws push again while no
+    /// image changed its scale (TextureCache::ScaleEpoch).
+    std::vector<DescriptorUpdateEntry> kept_image_entries;
+    std::array<std::pair<u32, u32>, NUM_STAGES> kept_image_ranges{};
+    std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> kept_rescaling{};
+    u64 kept_scale_epoch{};
+    bool kept_images_valid{};
 
     vk::DescriptorSetLayout descriptor_set_layout;
     DescriptorAllocator descriptor_allocator;

@@ -40,6 +40,11 @@ XCI::XCI(VirtualFile file_, u64 program_id, size_t program_index)
         return;
     }
 
+    if (header.hfs_offset > file->GetSize()) {
+        status = Loader::ResultStatus::ErrorBadXCIHeader;
+        return;
+    }
+
     PartitionFilesystem main_hfs(std::make_shared<OffsetVfsFile>(
         file, file->GetSize() - header.hfs_offset, header.hfs_offset));
 
@@ -58,9 +63,12 @@ XCI::XCI(VirtualFile file_, u64 program_id, size_t program_index)
         partitions_raw[static_cast<std::size_t>(partition)] = std::move(raw);
     }
 
-    secure_partition = std::make_shared<NSP>(
-        main_hfs.GetFile(partition_names[static_cast<std::size_t>(XCIPartition::Secure)]),
-        program_id, program_index);
+    auto secure_raw = main_hfs.GetFile(partition_names[static_cast<std::size_t>(XCIPartition::Secure)]);
+    if (secure_raw == nullptr) {
+        status = Loader::ResultStatus::ErrorXCIMissingPartition;
+        return;
+    }
+    secure_partition = std::make_shared<NSP>(std::move(secure_raw), program_id, program_index);
 
     ncas = secure_partition->GetNCAsCollapsed();
     program =

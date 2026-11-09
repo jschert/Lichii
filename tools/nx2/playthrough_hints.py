@@ -202,8 +202,8 @@ def main():
         parser.error("expected a 16-digit hexadecimal title ID")
     if args.command == "export":
         data = args.cache.read_bytes()
-        if data[:12] not in (MAGIC + struct.pack("<I", 52), MAGIC + struct.pack("<I", 53)):
-            parser.error("expected a v52 or v53 Vulkan cache")
+        if data[:8] != MAGIC or struct.unpack_from("<I", data, 8)[0] not in (52, 53, 54):
+            parser.error("expected a v52, v53 or v54 Vulkan cache")
         if args.cache.parent.name.lower() != args.title:
             parser.error("cache directory does not match the title ID")
         hint = export_hints(data, args.title, args.game_version)
@@ -219,7 +219,7 @@ def main():
         parser.error("hint file exceeds 128 MiB")
     hint = json.loads(args.hints.read_bytes())
     if (not isinstance(hint, dict) or not isinstance(hint.get("pipelines"), list) or
-            hint.get("schema") != SCHEMA or hint.get("cache_version") not in (52, 53) or
+            hint.get("schema") != SCHEMA or hint.get("cache_version") not in (52, 53, 54) or
             hint.get("title_id") != args.title or hint.get("game_version") != args.game_version):
         parser.error("hint format, title, or game version does not match")
     summary = import_hints(args, hint)

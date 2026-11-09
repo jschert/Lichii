@@ -11,8 +11,10 @@ add_executable(tests
     video_core/unswizzle_workers.cpp
     video_core/aftermath_dump.cpp
     video_core/frame_dump_schedule.cpp
+    video_core/nx2_stutter_trace.cpp
     video_core/host_mip_limits.cpp
     video_core/gpu_timestamp.cpp
+    video_core/semaphore_waiters.cpp
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp
     core/nx2_debug_server.cpp
@@ -47,11 +49,16 @@ add_executable(tests
     video_core/storage_write_extent.cpp
     video_core/storage_buffer_control_flow.cpp
     core/nup_validation.cpp
+    core/nx_archive.cpp
+    frontend_common/nx_archive.cpp
+    core/vfs_vector.cpp
+    core/file_sys_parsers.cpp
     input_common/calibration_lifetime.cpp
     video_core/ampere_logged_numeric.cpp
     video_core/ampere_logged_textures.cpp
     video_core/native_texture_header_index.cpp
     video_core/texture_alias_ticks.cpp
+    video_core/sampled_views.cpp
     video_core/texture_handles.cpp
     video_core/ampere_selevet_modes.cpp
     video_core/ampere_selevet_spills.cpp
@@ -70,7 +77,6 @@ add_executable(tests
     video_core/ampere_trap_guards.cpp
     video_core/async_draw_policy.cpp
     video_core/async_shader_emission.cpp
-    video_core/pipeline_build.cpp
     video_core/oot_network.cpp
     video_core/page_filter.cpp
     video_core/pipeline_optimization.cpp
@@ -81,6 +87,7 @@ add_executable(tests
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
     video_core/gpu_written_pages.cpp
+    video_core/nx2_semaphore_mirror.cpp
     video_core/command_writer.cpp
     video_core/split_fence_wait.cpp
     video_core/command_snapshot_suspensions.cpp
@@ -104,6 +111,10 @@ add_executable(tests
     video_core/ampere_tennis_i2f.cpp
     video_core/ampere_tennis_tessellation.cpp
     video_core/pipeline_cache_files.cpp
+    video_core/shader_cache_v2.cpp
+    video_core/shader_cache_v2_programs.cpp
+    video_core/shader_cache_v2_driver.cpp
+    video_core/vulkan_pipeline_binaries.cpp
     video_core/shader_precache.cpp
     video_core/shader_object_pool.cpp
     video_core/storage_binding_capacity.cpp
@@ -121,6 +132,7 @@ add_executable(tests
     video_core/spirv_nan_safe_min_max.cpp
     video_core/virtual_range_cache.cpp
     common/bit_field.cpp
+    common/bit_util.cpp
     common/cityhash.cpp
     common/container_hash.cpp
     common/core_pinning.cpp
@@ -132,6 +144,7 @@ add_executable(tests
     common/host_memory_failure.cpp
     common/host_memory_test_access.h
     core/host_memory_failure.cpp
+    common/multi_level_page_table.cpp
     common/page_table.cpp
     common/param_package.cpp
     common/range_map.cpp
@@ -201,6 +214,9 @@ if (TARGET dynarmic::dynarmic)
     target_link_libraries(tests PRIVATE dynarmic::dynarmic)
 endif()
 
+target_compile_definitions(tests PRIVATE
+    LICHII_NX_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/core/nx_fixtures")
+
 add_test(NAME tests COMMAND tests)
 
 if (TARGET SDL3::SDL3)
@@ -221,6 +237,56 @@ add_executable(update_checker_tests
     ../frontend_common/update_installer.cpp)
 target_link_libraries(update_checker_tests PRIVATE common Catch2::Catch2WithMain)
 add_test(NAME update_checker_tests COMMAND update_checker_tests)
+
+# A libFuzzer target for the shader cache v2 reader, where the compiler has libFuzzer. Built on
+# request: ninja shader_cache_v2_fuzzer, then shader_cache_v2_fuzzer <corpus directory>
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_FLAGS -fsanitize=fuzzer)
+check_cxx_source_compiles("
+    #include <cstddef>
+    #include <cstdint>
+    extern \"C\" int LLVMFuzzerTestOneInput(const std::uint8_t*, std::size_t) { return 0; }"
+    HAVE_LIBFUZZER)
+unset(CMAKE_REQUIRED_FLAGS)
+if (HAVE_LIBFUZZER)
+    add_executable(shader_cache_v2_fuzzer EXCLUDE_FROM_ALL
+        fuzz/shader_cache_v2_reader.cpp
+        ../video_core/shader_cache_v2/cache_format.cpp)
+    target_compile_options(shader_cache_v2_fuzzer PRIVATE -fsanitize=fuzzer,address,undefined)
+    target_link_options(shader_cache_v2_fuzzer PRIVATE -fsanitize=fuzzer,address,undefined)
+    target_link_libraries(shader_cache_v2_fuzzer PRIVATE common xxhash)
+    if (BOOST_NO_HEADERS)
+        target_link_libraries(shader_cache_v2_fuzzer PRIVATE Boost::crc)
+    endif()
+endif()
+
+# The shader job scheduler on its own, so it can be built with a sanitizer: configure with
+# -DSHADER_JOBS_SANITIZER=thread (or address,undefined), then build and run shader_jobs_tests.
+set(SHADER_JOBS_SANITIZER "" CACHE STRING "Build shader_jobs_tests with -fsanitize=<value>")
+add_executable(shader_jobs_tests
+    video_core/shader_jobs.cpp
+    ../video_core/shader_jobs.cpp)
+target_link_libraries(shader_jobs_tests PRIVATE common Catch2::Catch2WithMain Threads::Threads)
+if (SHADER_JOBS_SANITIZER)
+    target_compile_options(shader_jobs_tests PRIVATE -fsanitize=${SHADER_JOBS_SANITIZER}
+        -fno-omit-frame-pointer -fno-sanitize-recover=all -g)
+    target_link_options(shader_jobs_tests PRIVATE -fsanitize=${SHADER_JOBS_SANITIZER})
+endif()
+add_test(NAME shader_jobs_tests COMMAND shader_jobs_tests)
+
+# Stage translation on shader job workers over the tools/shader-sweep fixtures. For
+# ThreadSanitizer the shader recompiler needs instrumenting too: configure a separate build with
+# -DCMAKE_C_FLAGS=-fsanitize=thread -DCMAKE_CXX_FLAGS=-fsanitize=thread, then build and run
+# shader_translation_tests.
+add_executable(shader_translation_tests
+    video_core/stage_translation.cpp
+    ../video_core/shader_jobs.cpp
+    ../video_core/shader_stage_translation.cpp)
+target_link_libraries(shader_translation_tests PRIVATE common shader_recompiler
+    Catch2::Catch2WithMain Threads::Threads)
+target_compile_definitions(shader_translation_tests PRIVATE
+    SHADER_SWEEP_FIXTURES="${PROJECT_SOURCE_DIR}/tools/shader-sweep/fixtures")
+add_test(NAME shader_translation_tests COMMAND shader_translation_tests)
 
 if (NOT ANDROID)
     target_sources(tests PRIVATE input_common/joycon_subcommand_response.cpp)

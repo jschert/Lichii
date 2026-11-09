@@ -1,0 +1,84 @@
+{
+  "_comment": "Copy, fill in the game paths and packages, then: cache_bench.py run --config bench.json --dry-run. Steps run through the debug server (docs/nx2/debug-mcp.md); wait_presents counts guest presents since launch.",
+  "user_dir": "C:/Users/Zortos/.capy/work/lichii-pgo-20261103/runtime/user",
+  "log_file": "C:/Users/Zortos/.capy/work/lichii-pgo-20261103/runtime/user/log/eden_log.txt",
+  "output_dir": "C:/Users/Zortos/.capy/work/cache-bench",
+  "debug_server": "127.0.0.1:6545",
+  "exe": "lichii.exe",
+  "repeats": 3,
+  "cache_states": ["cold", "warm"],
+  "mesh_modes": ["mesh", "no_mesh"],
+  "env": {},
+  "driver_cache_dirs": [],
+  "paths": {
+    "A": {
+      "package": "C:/Users/Zortos/.capy/work/lichii-debug/<build-a>",
+      "env": {}
+    },
+    "B": {
+      "package": "C:/Users/Zortos/.capy/work/lichii-debug/<build-b>",
+      "env": {}
+    }
+  },
+  "games": {
+    "oot": {
+      "title_id": "0400486024DEC000",
+      "game": "C:/path/to/The Legend of Zelda Ocarina of Time.nsp",
+      "boot_timeout_s": 900,
+      "measure_s": 60,
+      "steps": [
+        {"wait_presents": 900, "timeout_s": 600},
+        {"screenshot": "after-boot"},
+        {"measure": 60},
+        {"screenshot": "end"}
+      ]
+    },
+    "mkw": {
+      "title_id": "0400C3F00006E000",
+      "game": "C:/path/to/Mario Kart World.nsp",
+      "boot_timeout_s": 900,
+      "measure_s": 70,
+      "steps": [
+        {"wait_presents": 780, "timeout_s": 600},
+        {
+          "input_sequence": [
+            {
+              "buttons": ["L", "R"],
+              "frames": 10
+            },
+            {"frames": 60},
+            {
+              "repeat": 24,
+              "steps": [{"buttons": ["A"], "frames": 4}, {"frames": 36}]
+            },
+            {"frames": 80}
+          ]
+        },
+        {"screenshot": "menus-done"},
+        {
+          "input_sequence": [{"buttons": ["A"], "frames": 1500}]
+        },
+        {"screenshot": "race"},
+        {
+          "measure": 70,
+          "input": {
+            "buttons": ["A"]
+          }
+        },
+        {"screenshot": "end"}
+      ]
+    },
+    "dkb": {
+      "title_id": "040074A01BF12000",
+      "game": "C:/path/to/Donkey Kong Bananza.nsp",
+      "boot_timeout_s": 900,
+      "measure_s": 60,
+      "steps": [
+        {"wait_presents": 900, "timeout_s": 600},
+        {"screenshot": "after-boot"},
+        {"measure": 60},
+        {"screenshot": "end"}
+      ]
+    }
+  }
+}

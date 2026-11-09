@@ -6,6 +6,10 @@
 
 #pragma once
 
+#ifdef _WIN32
+#include <thread>
+#endif
+
 #include "common/host_memory.h"
 #include "common/typed_address.h"
 
@@ -66,6 +70,13 @@ public:
     }
 
     Common::HostMemory buffer;
+
+#ifdef _WIN32
+private:
+    void TrimZeroPages(std::stop_token stop);
+
+    std::jthread zero_trim_thread;
+#endif
 };
 
 } // namespace Core

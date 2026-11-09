@@ -8,9 +8,11 @@
 
 #include <array>
 #include <filesystem>
+#include <functional>
 #include <iosfwd>
 #include <limits>
 #include <memory>
+#include <chrono>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -23,27 +25,18 @@
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/ampere/instruction.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/native_lowering.h"
 
 namespace Tegra {
 class Memorymanager;
 }
 
-namespace VideoCommon {
+namespace VideoCommon::ShaderCacheV2 {
+class Cache;
+struct ProgramRecord;
+} // namespace VideoCommon::ShaderCacheV2
 
-/// A native (Switch 2) program after capture and lowering to Maxwell code. The shader cache keeps
-/// it so the environments built for the program's pipelines don't capture and lower it again.
-struct LoweredNativeCode {
-    u64 native_program_key{};
-    /// Shader header, lowered instructions with Maxwell scheduling words, then the native
-    /// address map (what the environment's `code` used to be filled with).
-    std::vector<u64> code;
-    std::vector<Shader::Ampere::Instruction> trap_prefix;
-    /// Bytes of the native program that were read, header included.
-    size_t source_size{};
-    /// Constant buffer holding the texture handles if the program requires one, otherwise ~0U
-    /// (the engine's register value is used).
-    u32 texture_bound = ~0U;
-};
+namespace VideoCommon {
 
 class GenericEnvironment : public Shader::Environment {
 public:
@@ -98,6 +91,11 @@ public:
         return lowered_native;
     }
 
+    /// The v2 cache record of the native program this environment lowered, once
+    [[nodiscard]] std::shared_ptr<const ShaderCacheV2::ProgramRecord> TakeProgramRecord() noexcept {
+        return std::move(program_record);
+    }
+
     /// False for a program with instructions outside what is cached, or with more values of a
     /// kind than a cache record holds
     [[nodiscard]] bool CanBeSerialized() const noexcept;
@@ -106,12 +104,19 @@ public:
     /// GPU memory (precompile and disk environments).
     [[nodiscard]] std::vector<u8> ReadProgramBytes(u32 offset, u32 size) const;
 
+    /// The texture descriptor pool was flushed on the GPU thread before this environment's
+    /// translation moved to another thread, which may not flush: descriptors are read as they
+    /// are in memory. Nothing can make the pool dirty again while the GPU thread waits for it.
+    void SetTexturePoolFlushed() noexcept {
+        texture_pool_flushed = true;
+    }
+
     [[nodiscard]] u64 CalculateHash() const;
 
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
     /// Writes the environment, with the host's Shader::HostTranslateInfo::EnvironmentReadProperties
-    void Serialize(std::ofstream& file, u32 read_properties) const;
+    void Serialize(std::ostream& file, u32 read_properties) const;
 
     bool HasHLEMacroState() const override {
         return has_hle_engine_state;
@@ -196,16 +201,22 @@ protected:
     virtual std::optional<u32> ReadTrapGuardConstant(u32, u32) { return std::nullopt; }
 
     /// Adopts an already lowered native program, or captures and lowers it when there is none.
+    /// With a v2 cache, a captured program it holds a record of isn't lowered again.
     void InitializeNativeCode(std::shared_ptr<const LoweredNativeCode> lowered,
-                              u32 source_header_size = 128, bool geometry_stage = false);
+                              u32 source_header_size = 128, bool geometry_stage = false,
+                              ShaderCacheV2::Cache* cache_v2 = nullptr);
     std::shared_ptr<const LoweredNativeCode> LowerNativeCode(u32 source_header_size,
-                                                          bool geometry_stage);
+                                                          bool geometry_stage,
+                                                          ShaderCacheV2::Cache* cache_v2);
     /// Lowers captured native instructions (`sph` and `stage` already set) and packs the result.
+    /// nx2 shaderwarm: the precompile lowers captured programs without GPU memory.
     std::shared_ptr<const LoweredNativeCode> LowerCapturedNative(
         std::vector<Shader::Ampere::Instruction>& native, u32 source_header_size,
-        bool geometry_stage);
+        bool geometry_stage, ShaderCacheV2::Cache* cache_v2 = nullptr,
+        std::chrono::steady_clock::time_point capture_begin = {});
     size_t native_source_size{};
     std::shared_ptr<const LoweredNativeCode> lowered_native;
+    std::shared_ptr<const ShaderCacheV2::ProgramRecord> program_record;
 
     Tegra::Texture::TICEntry ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
                                              bool via_header_index, u32 raw);
@@ -236,6 +247,7 @@ protected:
 
     bool has_unbound_instructions = false;
     bool has_hle_engine_state = false;
+    bool texture_pool_flushed = false;
 };
 
 class GraphicsEnvironment final : public GenericEnvironment {
@@ -248,7 +260,8 @@ public:
                                  Tegra::MemoryManager& gpu_memory_,
                                  Tegra::Engines::Maxwell3D::Regs::ShaderType program,
                                  GPUVAddr program_base_, u32 start_address_,
-                                 std::shared_ptr<const LoweredNativeCode> lowered_native_ = {});
+                                 std::shared_ptr<const LoweredNativeCode> lowered_native_ = {},
+                                 ShaderCacheV2::Cache* cache_v2 = nullptr);
 
     ~GraphicsEnvironment() override = default;
 
@@ -278,7 +291,8 @@ public:
     explicit ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_compute_,
                                 Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
                                 u32 start_address_,
-                                std::shared_ptr<const LoweredNativeCode> lowered_native_ = {});
+                                std::shared_ptr<const LoweredNativeCode> lowered_native_ = {},
+                                ShaderCacheV2::Cache* cache_v2 = nullptr);
 
     ~ComputeEnvironment() override = default;
 
@@ -335,7 +349,7 @@ public:
     FileEnvironment(const FileEnvironment&) = delete;
 
     /// Reads an environment that must end before `end`, the end of the file
-    void Deserialize(std::ifstream& file, std::streampos end);
+    void Deserialize(std::istream& file, std::streampos end);
 
     [[nodiscard]] size_t MemorySize() const;
 
@@ -467,7 +481,51 @@ void LoadPipelines(std::stop_token stop_loading, const std::filesystem::path& fi
 
 /// The record a LoadPipelines callback has read: from `begin`, where its environment count is, to
 /// where `file` is now, after its key.
-[[nodiscard]] PipelineRecord ReadPipelineRecord(std::ifstream& file, u64 begin);
+[[nodiscard]] PipelineRecord ReadPipelineRecord(std::istream& file, u64 begin);
+
+/// The bytes SerializePipeline appends for a record, for a shader cache v2 record. Empty when an
+/// environment can't be serialized (see GenericEnvironment::CanBeSerialized).
+[[nodiscard]] std::vector<u8> SerializePipelinePayload(
+    std::span<const char> key, std::span<const GenericEnvironment* const> envs,
+    u32 read_properties);
+
+/// Reads one record held in memory (SerializePipelinePayload) as LoadPipelines reads one in a
+/// file: the callback reads the key. Throws std::ios_base::failure when the record is damaged or
+/// has bytes after its key.
+void ReadPipelinePayload(
+    std::span<const u8> payload,
+    Common::UniqueFunction<void, std::istream&, FileEnvironment>& load_compute,
+    Common::UniqueFunction<void, std::istream&, std::vector<FileEnvironment>>& load_graphics);
+
+/// New code for the native program of an environment in a cache record (ReplacePipelineCode)
+struct NativeCodeReplacement {
+    std::span<const u64> code;
+    u32 texture_bound; ///< The environment's texture bound buffer with this code
+};
+
+/// Answers, for the shader hash (NativeShaderHash) of a native environment's code and its texture
+/// bound buffer, the code to replace it with, or nothing to keep it
+using NativeCodeReplacer =
+    std::function<std::optional<NativeCodeReplacement>(u64 shader_hash, u32 texture_bound)>;
+
+struct ReplacedPipelineCode {
+    std::vector<u8> payload;
+    /// For each environment, the shader hash of its code before and after (equal when kept)
+    std::vector<std::pair<u64, u64>> shader_hashes;
+};
+
+/// A record (SerializePipelinePayload) with the code of its native environments replaced as
+/// `replace` answers, and every other byte kept, the key included. Throws std::ios_base::failure
+/// when the record is damaged, as ReadPipelinePayload does.
+[[nodiscard]] ReplacedPipelineCode ReplacePipelineCode(std::span<const u8> payload,
+                                                       const NativeCodeReplacer& replace);
+
+/// Reads the records of a cache file in order, up to the first damaged one, without its lock and
+/// without ever changing or removing the file. False when it isn't a cache of this version.
+bool ReadPipelinesUnchanged(
+    const std::filesystem::path& filename, u32 cache_version,
+    Common::UniqueFunction<void, std::istream&, FileEnvironment> load_compute,
+    Common::UniqueFunction<void, std::istream&, std::vector<FileEnvironment>> load_graphics);
 
 /// Throws std::ios_base::failure, as for a damaged record, unless a graphics record's key has as
 /// many nonzero shader hashes as the record has environments: one is built from each.

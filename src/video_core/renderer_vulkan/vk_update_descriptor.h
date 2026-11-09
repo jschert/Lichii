@@ -6,7 +6,9 @@
 
 #pragma once
 
+#include <cstring>
 #include <memory>
+#include <span>
 #include <variant>
 #include <vector>
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -103,6 +105,12 @@ public:
 
     void AddTexelBuffer(VkBufferView texel_buffer) {
         *(payload_cursor++) = texel_buffer;
+    }
+
+    /// Entries an earlier draw added (delta draws).
+    void AddEntries(std::span<const DescriptorUpdateEntry> entries) {
+        std::memcpy(payload_cursor, entries.data(), entries.size_bytes());
+        payload_cursor += entries.size();
     }
 
     void AddTexelBuffer(VkBufferView texel_buffer, VkDeviceAddress base_address,

@@ -391,6 +391,11 @@ public:
         image_bit = 1u << (image_index % 32);
     }
 
+    /// The words of an earlier draw's pushes (delta draws); push no more.
+    void Assign(const std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>& data) noexcept {
+        words = data;
+    }
+
 private:
     std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> words{};
     u32* texture_ptr{words.data()};

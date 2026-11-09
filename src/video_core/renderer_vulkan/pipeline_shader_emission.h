@@ -28,4 +28,12 @@ inline std::vector<u32> EmitPipelineShader(const Shader::Profile& profile,
     return code;
 }
 
+/// A compute program's SPIR-V, as EmitPipelineShader emits a graphics stage's
+inline std::vector<u32> EmitComputeShader(const Shader::Profile& profile,
+                                          Shader::IR::Program& program, u64 shader_hash,
+                                          std::span<const u32> reference = {}) {
+    Shader::Backend::Bindings binding;
+    return EmitPipelineShader(profile, {}, program, binding, shader_hash, reference);
+}
+
 } // namespace Vulkan

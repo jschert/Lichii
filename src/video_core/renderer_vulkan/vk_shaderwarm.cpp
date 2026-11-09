@@ -1096,13 +1096,17 @@ void PipelineCache::RunPrecompile(std::filesystem::path pack_path, std::stop_tok
             const std::vector<u32> code{EmitSPIRV(profile, program)};
             LogComputeSpirv("precompile", record.unique_hash, program, code);
             vk::ShaderModule module{BuildShader(device, code)};
+            // Built here, on this thread (no build queue, no driver blob store: the driver's
+            // own cache keeps it).
             ComputePipeline pipeline{device,
                                      scheduler,
                                      vulkan_pipeline_cache,
+                                     nullptr,
+                                     0,
                                      descriptor_pool,
                                      guest_descriptor_queue,
                                      descriptor_buffer_ring,
-                                     nullptr,
+                                     PipelineBuildQueue{},
                                      nullptr,
                                      nullptr,
                                      program.info,

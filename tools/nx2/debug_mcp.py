@@ -246,6 +246,12 @@ TOOLS = [
             "required": ["steps"],
         },
     },
+    {
+        "name": "host_timing",
+        "description": "Turns the per-second 'HostTiming wait' log line (EDEN_NX2_HOSTTIMING_STATS) "
+                       "on or off; read it with log_tail. Returns the previous and current state.",
+        "inputSchema": {"type": "object", "properties": {"stats": {"type": "boolean"}}},
+    },
 ]
 
 TOOL_NAMES = {tool["name"] for tool in TOOLS}

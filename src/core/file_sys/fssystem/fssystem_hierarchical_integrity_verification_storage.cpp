@@ -20,8 +20,10 @@ Result HierarchicalIntegrityVerificationStorage::Initialize(
     const HierarchicalIntegrityVerificationInformation& info,
     HierarchicalStorageInformation storage, int max_data_cache_entries, int max_hash_cache_entries,
     s8 buffer_level) {
-    // Validate preconditions.
-    ASSERT(IntegrityMinLayerCount <= info.max_layers && info.max_layers <= IntegrityMaxLayerCount);
+    // Validate the layer count. With fewer than three layers there is no level between the master
+    // hash and the data for the loops below to set up.
+    R_UNLESS(IntegrityMinLayerCount < info.max_layers && info.max_layers <= IntegrityMaxLayerCount,
+             ResultInvalidNcaHierarchicalIntegrityVerificationLayerCount);
 
     // Set member variables.
     m_max_layers = info.max_layers;

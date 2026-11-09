@@ -51,6 +51,24 @@ add_executable(shader-sweep main.cpp diagnostics.cpp)
 target_link_libraries(shader-sweep PRIVATE common shader_recompiler)
 target_include_directories(shader-sweep PRIVATE ${REPOSITORY_ROOT}/src)
 create_target_directory_groups(shader-sweep)
+if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    # In the tree, --path v2 replays through the production shader cache v2
+    target_sources(shader-sweep PRIVATE vma.cpp)
+    if(NOT MSVC)
+        set_source_files_properties(vma.cpp PROPERTIES COMPILE_OPTIONS
+            "-Wno-conversion;-Wno-unused-variable;-Wno-unused-parameter;-Wno-missing-field-initializers;-Wno-nullability-completeness")
+    endif()
+    # core needs frontend_common's play time manager, so it links after core
+    target_link_libraries(shader-sweep PRIVATE video_core core frontend_common)
+    target_compile_definitions(shader-sweep PRIVATE SHADER_SWEEP_V2)
+    if(YUZU_TESTS)
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        add_test(NAME shader-sweep-replay-v2
+            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_replay.py"
+                    $<TARGET_FILE:shader-sweep> --v2
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    endif()
+endif()
 
 add_executable(nup-shader-export
     nup_export.cpp
@@ -76,6 +94,9 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         add_test(NAME shader-sweep-captured
             COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_captured.py"
                     $<TARGET_FILE:shader-sweep> --spirv-val "${SPIRV_VAL_EXECUTABLE}")
+        add_test(NAME shader-sweep-replay
+            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_replay.py"
+                    $<TARGET_FILE:shader-sweep>)
         add_test(NAME shader-sweep-cache-parser
             COMMAND Python3::Interpreter -m unittest discover
                     -s "${REPOSITORY_ROOT}/tools/nx2" -p "test_shader_*.py")

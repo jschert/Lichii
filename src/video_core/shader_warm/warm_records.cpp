@@ -4,17 +4,16 @@
 #include <algorithm>
 #include <cstring>
 
-#include "common/cityhash.h"
 #include "shader_recompiler/frontend/ampere/instruction.h"
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
 #include "shader_recompiler/frontend/ampere/program_capture.h"
+#include "shader_recompiler/program_header.h"
+#include "video_core/native_lowering.h"
 #include "video_core/shader_warm/warm_records.h"
 
 namespace VideoCommon::ShaderWarm {
 namespace {
 
-constexpr u64 AddressMapMagic = 0x50414d4e4544454EULL;
-constexpr u64 HashXor = 0x4F554E4345000002ULL;
 constexpr size_t EnvHeaderSize = 6 * 8 + 7 * 4;
 constexpr u32 ComputeStage = 5;
 
@@ -85,41 +84,27 @@ std::optional<std::string> LowerProgram(std::span<const u8> program, LoweredCode
             return "Trap guards require captured constant buffers";
         }
     }
-    const auto lowered = Shader::Ampere::LowerToMaxwell(native, false, true, {},
-                                                        Shader::Ampere::TessellationStage::None);
+    // As the emulator lowers a compute program, which has no header (see LowerNativeCode)
+    auto lowered = VideoCommon::LowerNativeProgram(native, {});
     if (!lowered) {
         return std::string(lowered.error);
     }
-    const auto& offsets = lowered.source_instruction_offsets;
     if (lowered.source_size != native.size() * sizeof(Instruction) ||
-        offsets.size() != native.size()) {
+        lowered.source_instruction_offsets.size() != native.size()) {
         return "Cannot encode the lowering as an override record";
     }
-    std::vector<u64> words(10, 0);
-    words.reserve(10 + lowered.instructions.size() * 5 / 4 + 4 + offsets.size());
-    for (const u64 instruction : lowered.instructions) {
-        if (words.size() % 4 == 0) {
-            words.push_back(0); // Maxwell scheduling word
-        }
-        words.push_back(instruction);
-    }
-    words.push_back(0);
-    if (!offsets.empty()) {
-        // AppendNativeAddressMap: lowered index -> byte address inside the code.
-        for (const u32 i : offsets) {
-            words.push_back(0x50 + u64{i} * 8 + ((u64{i} + 1) / 3) * 8);
-        }
-        words.push_back(offsets.size());
-        words.push_back(AddressMapMagic);
-    }
-    out.code.resize(words.size() * sizeof(u64));
-    std::memcpy(out.code.data(), words.data(), out.code.size());
-    out.texture_buffer = lowered.required_texture_buffer;
+    const auto code = VideoCommon::MakeLoweredNativeCode(native, Shader::ProgramHeader{}, 0, {},
+                                                         lowered);
+    out.code.resize(code->code.size() * sizeof(u64));
+    std::memcpy(out.code.data(), code->code.data(), out.code.size());
+    out.texture_buffer = code->texture_bound;
     return std::nullopt;
 }
 
 u64 StageHash(std::span<const u8> code) {
-    return Common::CityHash64(reinterpret_cast<const char*>(code.data()), code.size()) ^ HashXor;
+    std::vector<u64> words(code.size() / sizeof(u64));
+    std::memcpy(words.data(), code.data(), words.size() * sizeof(u64));
+    return VideoCommon::NativeShaderHash(words);
 }
 
 std::optional<ComputeControl> ReadComputeControl(std::span<const u8> control) {

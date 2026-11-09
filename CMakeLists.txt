@@ -84,6 +84,18 @@ cmake_dependent_option(YUZU_USE_BUNDLED_QT "Download bundled Qt binaries" "${MSV
 option(ENABLE_DEBUG_TOOLS "Enable debugging tools (maxwell disassembler, SPIRV translator, etc)" OFF)
 option(ENABLE_WERROR "Enable -Werror diagnostics" ON)
 
+option(LICHII_FUZZERS "Build libFuzzer harnesses for the game-file parsers (clang only; instruments everything with ASan and UBSan)" OFF)
+if (LICHII_FUZZERS)
+    if (NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR MSVC)
+        message(FATAL_ERROR "LICHII_FUZZERS needs clang with libFuzzer")
+    endif()
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:C,CXX>:-fsanitize=address,undefined,fuzzer-no-link>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-fno-sanitize-recover=undefined>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-fno-omit-frame-pointer>)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+
 # Handle specific -Werror downgrades safely across platforms
 if(ENABLE_WERROR)
     if(CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -474,6 +486,9 @@ if (zstd_ADDED)
     add_library(zstd::zstd ALIAS libzstd_static)
     add_library(zstd::libzstd ALIAS libzstd_static)
 endif()
+
+# nxformat (.nx game archives)
+include(NxFormat)
 
 # nlohmann
 AddJsonPackage(nlohmann)

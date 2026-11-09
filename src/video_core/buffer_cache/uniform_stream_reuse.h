@@ -50,7 +50,8 @@ public:
     struct Slot {
         Ref ref{};
         u64 tick{};
-        u32 size{}; // 0: nothing streamed yet
+        u64 device_addr{}; ///< Where `bytes` were last read
+        u32 size{};        // 0: nothing streamed yet
         std::array<u8, MaxBytes> bytes{};
     };
 
@@ -102,6 +103,7 @@ template <class Runtime, class DeviceMemory>
 
     const bool same_bytes =
         slot.size == size && std::memcmp(slot.bytes.data(), scratch, size) == 0;
+    slot.device_addr = device_addr;
     if (same_bytes && slot.tick == runtime.CurrentTick()) {
         runtime.RebindStreamUniform(slot.ref, size);
         return true;
@@ -116,6 +118,47 @@ template <class Runtime, class DeviceMemory>
         std::memcpy(slot.bytes.data(), scratch, size);
     }
     return true;
+}
+
+/// Uniform keeps: binds the slot's last allocation again without reading guest memory,
+/// when that bind read the same range in this command buffer. The caller guarantees that nothing
+/// ordered before this draw wrote the range since that bind (the previous draw's). Returns false
+/// (nothing bound) otherwise.
+template <class Runtime>
+[[nodiscard]] bool RebindKeptUniform(Runtime& runtime, size_t stage, u32 index, u64 device_addr,
+                                     u32 size) {
+    using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
+    if (size == 0 || size > Reuse::MaxBytes || stage >= Reuse::NumStages ||
+        index >= Reuse::NumSlots) {
+        return false;
+    }
+    const typename Reuse::Slot& slot =
+        UniformStreamReuseState<typename Runtime::StreamUniformRef>().slots[stage][index];
+    if (slot.size != size || slot.device_addr != device_addr ||
+        slot.tick != runtime.CurrentTick()) {
+        return false;
+    }
+    runtime.RebindStreamUniform(slot.ref, size);
+    return true;
+}
+
+/// EDEN_NX2_UBO_KEEP_VERIFY: whether guest memory still holds the bytes the slot's last
+/// bind read from the range RebindKeptUniform would reuse.
+template <class Runtime, class DeviceMemory>
+[[nodiscard]] bool KeptUniformHolds(DeviceMemory& device_memory, size_t stage, u32 index,
+                                    u64 device_addr, u32 size) {
+    using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
+    if (size == 0 || size > Reuse::MaxBytes || stage >= Reuse::NumStages ||
+        index >= Reuse::NumSlots) {
+        return false;
+    }
+    Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
+    const typename Reuse::Slot& slot = reuse.slots[stage][index];
+    if (slot.size != size || slot.device_addr != device_addr) {
+        return false;
+    }
+    device_memory.ReadBlockUnsafe(device_addr, reuse.scratch.data(), size);
+    return std::memcmp(slot.bytes.data(), reuse.scratch.data(), size) == 0;
 }
 
 } // namespace VideoCommon

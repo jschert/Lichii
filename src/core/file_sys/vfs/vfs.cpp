@@ -176,8 +176,12 @@ std::optional<u8> VfsFile::ReadByte(std::size_t offset) const {
 }
 
 std::vector<u8> VfsFile::ReadBytes(std::size_t size, std::size_t offset) const {
-    std::vector<u8> out(size);
-    std::size_t read_size = Read(out.data(), size, offset);
+    const std::size_t file_size = GetSize();
+    if (offset >= file_size || size == 0) {
+        return {};
+    }
+    std::vector<u8> out((std::min)(size, file_size - offset));
+    std::size_t read_size = Read(out.data(), out.size(), offset);
     out.resize(read_size);
     return out;
 }

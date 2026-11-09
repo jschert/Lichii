@@ -17,6 +17,7 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <utility>
 
 #include "common/alignment.h"
@@ -40,9 +41,11 @@
 #include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
+#include "video_core/native_lowering.h"
 #include "video_core/nx2_debug_control.h"
-#include "video_core/mkw_wave_workaround.h"
 #include "video_core/pipeline_cache_files.h"
+#include "video_core/shader_cache_v2/cache.h"
+#include "video_core/shader_cache_v2/records.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/textures/texture.h"
@@ -85,13 +88,6 @@ static std::vector<u64> MappedStoragePointerKeys(
     }
     std::ranges::sort(keys);
     return keys;
-}
-
-// The shader hash of lowered native code (frame dump "shaders", pipeline cache keys), with a
-// version tag that isolates this experimental ABI.
-static u64 NativeShaderHash(std::span<const u64> code) {
-    return Common::CityHash64(reinterpret_cast<const char*>(code.data()), code.size() * sizeof(u64)) ^
-           0x4f554e4345000002ULL;
 }
 
 static constexpr u64 MakeCbufKey(u32 index, u32 offset) {
@@ -379,7 +375,7 @@ void GenericEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {
     DumpImpl(pipeline_hash, shader_hash, code, read_highest, read_lowest, initial_offset, stage);
 }
 
-void GenericEnvironment::Serialize(std::ofstream& file, u32 read_properties) const {
+void GenericEnvironment::Serialize(std::ostream& file, u32 read_properties) const {
     const u64 code_size{static_cast<u64>(CachedSizeBytes())};
     const u64 num_texture_types{static_cast<u64>(texture_types.size())};
     const u64 num_texture_pixel_formats{static_cast<u64>(texture_pixel_formats.size())};
@@ -505,7 +501,11 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
         return entry;
     }
     const GPUVAddr descriptor_addr{tic_addr + index * sizeof(Tegra::Texture::TICEntry)};
-    gpu_memory->ReadBlock(descriptor_addr, &entry, sizeof(entry));
+    if (texture_pool_flushed) {
+        gpu_memory->ReadBlockUnsafe(descriptor_addr, &entry, sizeof(entry));
+    } else {
+        gpu_memory->ReadBlock(descriptor_addr, &entry, sizeof(entry));
+    }
     if (entry.format.Value() == Tegra::Texture::TextureFormat{} &&
         std::getenv("EDEN_NX2_RENDER_TRACE")) {
         static std::atomic<u32> traces{};
@@ -581,9 +581,10 @@ private:
 // A native program is captured and lowered once, when the shader cache first meets it. The
 // environments built later for its pipelines receive that result instead of lowering again.
 void GenericEnvironment::InitializeNativeCode(std::shared_ptr<const LoweredNativeCode> lowered,
-                                              u32 source_header_size, bool geometry_stage) {
+                                              u32 source_header_size, bool geometry_stage,
+                                              ShaderCacheV2::Cache* cache_v2) {
     if (!lowered) {
-        lowered = LowerNativeCode(source_header_size, geometry_stage);
+        lowered = LowerNativeCode(source_header_size, geometry_stage, cache_v2);
     }
     if (!Shader::Ampere::VerifyTrapGuards(lowered->trap_prefix, [&](u32 bank, u32 offset) {
             return ReadTrapGuardConstant(bank, offset);
@@ -600,9 +601,11 @@ void GenericEnvironment::InitializeNativeCode(std::shared_ptr<const LoweredNativ
     lowered_native = std::move(lowered);
 }
 
-std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32 source_header_size,
-                                                                         bool geometry_stage) {
+std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
+    u32 source_header_size, bool geometry_stage, ShaderCacheV2::Cache* cache_v2) {
     using Shader::Ampere::Instruction;
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point capture_begin = cache_v2 ? Clock::now() : Clock::time_point{};
     const u32 native_header_size = source_header_size;
     constexpr u32 maximum_instructions = Shader::Ampere::ProgramCaptureState::MaximumInstructions;
     std::vector<Instruction> native;
@@ -639,18 +642,21 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
         }
         if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) break;
     }
-    return LowerCapturedNative(native, native_header_size, geometry_stage);
+    return LowerCapturedNative(native, native_header_size, geometry_stage, cache_v2,
+                               capture_begin);
 }
 
 std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerCapturedNative(
     std::vector<Shader::Ampere::Instruction>& native, u32 source_header_size,
-    bool geometry_stage) {
+    bool geometry_stage, ShaderCacheV2::Cache* cache_v2,
+    std::chrono::steady_clock::time_point capture_begin) {
     using Shader::Ampere::Instruction;
+    using Clock = std::chrono::steady_clock;
+    if (cache_v2 && capture_begin == Clock::time_point{}) {
+        capture_begin = Clock::now();
+    }
     const u32 native_header_size = source_header_size;
-    std::vector<u32> verified_traps;
-    for (u32 i = 0; i < native.size(); ++i)
-        if (native[i].Bits(0, 12) == 0x95c)
-            verified_traps.push_back(i * sizeof(Instruction));
+    const std::vector<u32> verified_traps = NativeTrapOffsets(native);
     const size_t trap_count = verified_traps.empty() ? 0 : verified_traps.back() / sizeof(Instruction) + 1;
     if (trap_count && (stage != Shader::Stage::Compute ||
                       !Shader::Ampere::VerifyTrapGuards(std::span{native}.first(trap_count),
@@ -663,12 +669,30 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerCapturedNative
                                    : stage == Shader::Stage::TessellationEval
                                        ? Shader::Ampere::TessellationStage::Evaluation
                                        : Shader::Ampere::TessellationStage::None;
-    auto lowered = Shader::Ampere::LowerToMaxwell(
-        native, {.geometry = geometry_stage,
-                 .tensor = true,
-                 .native_code_address = program_base + native_header_size,
-                 .verified_traps = verified_traps,
-                 .tessellation_stage = tessellation_stage});
+    const NativeLoweringInputs inputs{.geometry = geometry_stage,
+                                      .tessellation_stage = tessellation_stage,
+                                      .native_code_address = program_base + native_header_size};
+    // A program the v2 cache holds a record of from this build's lowering is not lowered again:
+    // the lowering depends on nothing else. Every check below still runs on its code.
+    ShaderCacheV2::FoundProgram found;
+    if (cache_v2) {
+        found = cache_v2->FindProgram(ShaderCacheV2::MakeProgramKeyInputs(
+            stage, native_header_size, sph, native, inputs, verified_traps));
+    }
+    const Clock::time_point lookup_end = cache_v2 ? Clock::now() : Clock::time_point{};
+    Shader::Ampere::LoweredProgram lowered;
+    if (!found.code) {
+        lowered = LowerNativeProgram(native, inputs);
+    }
+    if (cache_v2) {
+        const auto nanoseconds = [](Clock::duration duration) {
+            return static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count());
+        };
+        cache_v2->CountProgram(found.lookup, nanoseconds(lookup_end - capture_begin),
+                               found.code ? 0 : nanoseconds(Clock::now() - lookup_end));
+    }
+    bool overridden = false;
     // EDEN_NX2_REJECT=<hex address>,...: treat these programs as rejected (to find which newly
     // lowered program changes a game's behaviour without rebuilding).
     if (static const std::string reject_list = [] {
@@ -711,7 +735,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerCapturedNative
             }
         }
     }
-    if (!lowered && gpu_memory != nullptr) {
+    if (!found.code && !lowered && gpu_memory != nullptr) {
         if (const char* directory = std::getenv("EDEN_NATIVE_SHADER_OVERRIDE_DIR")) {
             const auto key = fmt::format("{:016x}", Shader::Ampere::NativeProgramKey(native));
             const auto folder = std::filesystem::path{directory};
@@ -756,6 +780,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerCapturedNative
                     }
                     lowered = Shader::Ampere::DecodeProgramOverride(bytes, native);
                     if (!lowered) throw Shader::RuntimeError("Native shader override rejected: {}", lowered.error);
+                    overridden = true;
                     LOG_WARNING(Shader, "Native shader resumed: key={}, instructions={}", key, lowered.instructions.size());
                     break;
                 }
@@ -763,7 +788,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerCapturedNative
             }
         }
     }
-    if (!lowered) {
+    if (!found.code && !lowered) {
         const size_t failed = lowered.error_offset / sizeof(Shader::Ampere::Instruction);
         const auto words = failed < native.size() ? native[failed].words : std::array<u32, 4>{};
         throw Shader::RuntimeError(
@@ -771,25 +796,11 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerCapturedNative
             program_base, lowered.error_offset, lowered.error, words[0] & 0xfff, words[0],
             words[1], words[2], words[3]);
     }
-    VideoCommon::ApplyMkwZeroDepthFallback(native, lowered);
-    auto result = std::make_shared<LoweredNativeCode>();
-    result->native_program_key = Shader::Ampere::NativeProgramKey(native);
-    result->texture_bound = lowered.required_texture_buffer;
-    result->source_size = native_header_size + lowered.source_size;
-    result->trap_prefix.assign(native.begin(), native.begin() + trap_count);
-    auto& lowered_code = result->code;
-    lowered_code.resize(sizeof(sph) / sizeof(u64));
-    std::memcpy(lowered_code.data(), &sph, sizeof(sph));
-    for (const u64 instruction : lowered.instructions) {
-        if ((lowered_code.size() * sizeof(u64)) % 32 == 0) {
-            lowered_code.push_back(0); // Maxwell scheduling word, absent from native instructions.
-        }
-        lowered_code.push_back(instruction);
+    std::shared_ptr<const LoweredNativeCode> result = found.code;
+    if (!result) {
+        result = MakeLoweredNativeCode(native, sph, native_header_size, verified_traps, lowered);
     }
-    // Keep the original padding ABI, then retain the native address map as
-    // unreachable data. Existing disk-cache serialization carries it with code.
-    lowered_code.push_back(0);
-    Shader::Ampere::AppendNativeAddressMap(lowered_code, lowered.source_instruction_offsets);
+    const auto& lowered_code = result->code;
     // EDEN_NX2_REJECT_HASH=<hash>,...: like EDEN_NX2_REJECT, but by native program key (shader
     // dump file names) or shader hash (frame dump "shaders"), which stay the same between runs.
     if (static const std::string reject_hashes = [] {
@@ -815,6 +826,17 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerCapturedNative
             }
         }
     }
+    if (found.code) {
+        LOG_DEBUG(Shader, "Native shader at {:#x} from its v2 record: {} source bytes",
+                  program_base, result->source_size);
+        return result;
+    }
+    // A program from an override file depends on more than the lowering: the v2 cache leaves it out.
+    if (cache_v2 && !overridden) {
+        program_record = std::make_shared<const ShaderCacheV2::ProgramRecord>(
+            ShaderCacheV2::MakeProgramRecord(stage, native_header_size, sph, native, inputs,
+                                             *result));
+    }
     LOG_DEBUG(Shader, "Lowered native shader at {:#x}: {} source bytes, {} instructions",
               program_base, result->source_size, lowered.instructions.size());
     return result;
@@ -824,7 +846,8 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                                          Tegra::MemoryManager& gpu_memory_,
                                          Maxwell::ShaderType program, GPUVAddr program_base_,
                                          u32 start_address_,
-                                         std::shared_ptr<const LoweredNativeCode> lowered_native_)
+                                         std::shared_ptr<const LoweredNativeCode> lowered_native_,
+                                         ShaderCacheV2::Cache* cache_v2)
     : GenericEnvironment{gpu_memory_, program_base_, start_address_}, maxwell3d{&maxwell3d_} {
     gpu_memory->ReadBlock(program_base + start_address, &sph, sizeof(sph));
     initial_offset = sizeof(sph);
@@ -975,7 +998,7 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                      static_cast<u32>(regs.tessellation.params.output_primitives.Value()),
                      regs.patch_vertices);
         }
-        InitializeNativeCode(std::move(lowered_native_), 128, geometry);
+        InitializeNativeCode(std::move(lowered_native_), 128, geometry, cache_v2);
     }
     const u64 local_size{sph.LocalMemorySize()};
     ASSERT(local_size <= (std::numeric_limits<u32>::max)());
@@ -1067,7 +1090,8 @@ u32 GraphicsEnvironment::ReadViewportTransformState() {
 ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_compute_,
                                        Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
                                        u32 start_address_,
-                                       std::shared_ptr<const LoweredNativeCode> lowered_native_)
+                                       std::shared_ptr<const LoweredNativeCode> lowered_native_,
+                                       ShaderCacheV2::Cache* cache_v2)
     : GenericEnvironment{gpu_memory_, program_base_, start_address_}, kepler_compute{
                                                                           &kepler_compute_} {
     const auto& qmd{kepler_compute->launch_description};
@@ -1080,7 +1104,7 @@ ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_com
     if (kepler_compute->IsNativeMode()) {
         initial_offset = sizeof(sph);
         is_proprietary_driver = true;
-        InitializeNativeCode(std::move(lowered_native_), 0);
+        InitializeNativeCode(std::move(lowered_native_), 0, false, cache_v2);
         start_address = sizeof(sph);
     }
 }
@@ -1192,7 +1216,7 @@ u32 ComputeEnvironment::ReadViewportTransformState() {
     return viewport_transform_state;
 }
 
-void FileEnvironment::Deserialize(std::ifstream& file, std::streampos end) {
+void FileEnvironment::Deserialize(std::istream& file, std::streampos end) {
     u64 code_size{};
     u64 num_texture_types{};
     u64 num_texture_pixel_formats{};
@@ -1527,6 +1551,35 @@ void SerializePipeline(std::span<const char> key, std::span<const GenericEnviron
     }
 }
 
+// Reads the environments of the record at the stream's position and passes them to the callback of
+// their kind, which reads the key
+template <typename Stream, typename LoadCompute, typename LoadGraphics>
+static void ReadPipelineEnvironments(Stream& file, std::streampos end, LoadCompute& load_compute,
+                                     LoadGraphics& load_graphics) {
+    const auto is_compute{[](const FileEnvironment& environment) {
+        return environment.ShaderStage() == Shader::Stage::Compute;
+    }};
+    u32 num_envs{};
+    file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+    if (num_envs == 0 || num_envs > Maxwell::MaxShaderProgram) {
+        throw std::ios_base::failure("Invalid number of shader environments");
+    }
+    std::vector<FileEnvironment> envs(num_envs);
+    for (FileEnvironment& env : envs) {
+        env.Deserialize(file, end);
+    }
+    // A compute record holds one environment, a graphics record no compute one.
+    const bool compute{is_compute(envs.front())};
+    if (compute ? num_envs != 1 : std::ranges::any_of(envs, is_compute)) {
+        throw std::ios_base::failure("Invalid shader stages in the pipeline cache");
+    }
+    if (compute) {
+        load_compute(file, std::move(envs.front()));
+    } else {
+        load_graphics(file, std::move(envs));
+    }
+}
+
 // LoadPipelines, holding the cache's lock when `locked`
 static void ReadPipelines(
     std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
@@ -1560,9 +1613,6 @@ static void ReadPipelines(
         }
         return;
     }
-    const auto is_compute{[](const FileEnvironment& environment) {
-        return environment.ShaderStage() == Shader::Stage::Compute;
-    }};
     // Where the record being read begins: the end of the complete records
     std::streampos record_begin{file.tellg()};
     try {
@@ -1570,25 +1620,7 @@ static void ReadPipelines(
             if (stop_loading.stop_requested()) {
                 return;
             }
-            u32 num_envs{};
-            file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
-            if (num_envs == 0 || num_envs > Maxwell::MaxShaderProgram) {
-                throw std::ios_base::failure("Invalid number of shader environments");
-            }
-            std::vector<FileEnvironment> envs(num_envs);
-            for (FileEnvironment& env : envs) {
-                env.Deserialize(file, end);
-            }
-            // A compute record holds one environment, a graphics record no compute one.
-            const bool compute{is_compute(envs.front())};
-            if (compute ? num_envs != 1 : std::ranges::any_of(envs, is_compute)) {
-                throw std::ios_base::failure("Invalid shader stages in the pipeline cache");
-            }
-            if (compute) {
-                load_compute(file, std::move(envs.front()));
-            } else {
-                load_graphics(file, std::move(envs));
-            }
+            ReadPipelineEnvironments(file, end, load_compute, load_graphics);
         }
     } catch (const std::bad_alloc& e) {
         // Memory is short, but the file is fine: it stays as it is.
@@ -1649,7 +1681,167 @@ void LoadPipelines(
                   std::move(load_compute), std::move(load_graphics));
 }
 
-PipelineRecord ReadPipelineRecord(std::ifstream& file, u64 begin) {
+namespace {
+
+// A stream over bytes in memory
+class SpanBuffer final : public std::streambuf {
+public:
+    explicit SpanBuffer(std::span<const u8> bytes) {
+        char* const begin = const_cast<char*>(reinterpret_cast<const char*>(bytes.data()));
+        setg(begin, begin, begin + bytes.size());
+    }
+
+protected:
+    pos_type seekoff(off_type offset, std::ios_base::seekdir direction,
+                     std::ios_base::openmode mode) override {
+        const off_type base = direction == std::ios_base::beg   ? 0
+                              : direction == std::ios_base::cur ? gptr() - eback()
+                                                                : egptr() - eback();
+        return seekpos(pos_type(base + offset), mode);
+    }
+
+    pos_type seekpos(pos_type position, std::ios_base::openmode) override {
+        const off_type offset{position};
+        if (offset < 0 || offset > egptr() - eback()) {
+            return pos_type(off_type(-1));
+        }
+        setg(eback(), eback() + offset, egptr());
+        return position;
+    }
+};
+
+} // Anonymous namespace
+
+std::vector<u8> SerializePipelinePayload(std::span<const char> key,
+                                         std::span<const GenericEnvironment* const> envs,
+                                         u32 read_properties) {
+    if (!std::ranges::all_of(envs, &GenericEnvironment::CanBeSerialized)) {
+        return {};
+    }
+    std::ostringstream stream(std::ios::binary);
+    const u32 num_envs{static_cast<u32>(envs.size())};
+    stream.write(reinterpret_cast<const char*>(&num_envs), sizeof(num_envs));
+    for (const GenericEnvironment* const env : envs) {
+        env->Serialize(stream, read_properties);
+    }
+    stream.write(key.data(), static_cast<std::streamsize>(key.size_bytes()));
+    const std::string bytes{std::move(stream).str()};
+    return {bytes.begin(), bytes.end()};
+}
+
+void ReadPipelinePayload(
+    std::span<const u8> payload,
+    Common::UniqueFunction<void, std::istream&, FileEnvironment>& load_compute,
+    Common::UniqueFunction<void, std::istream&, std::vector<FileEnvironment>>& load_graphics) {
+    SpanBuffer buffer{payload};
+    std::istream file{&buffer};
+    file.exceptions(std::ios::failbit);
+    const std::streampos end{static_cast<std::streamoff>(payload.size())};
+    ReadPipelineEnvironments(file, end, load_compute, load_graphics);
+    if (file.tellg() != end) {
+        throw std::ios_base::failure("Bytes after the key of a pipeline cache record");
+    }
+}
+
+ReplacedPipelineCode ReplacePipelineCode(std::span<const u8> payload,
+                                         const NativeCodeReplacer& replace) {
+    // Where Serialize writes the texture bound buffer, the read range and the code
+    constexpr size_t TextureBoundOffset = 6 * sizeof(u64) + sizeof(u32);
+    constexpr size_t ReadHighestOffset = TextureBoundOffset + 3 * sizeof(u32);
+    constexpr size_t CodeOffset = 6 * sizeof(u64) + 7 * sizeof(u32);
+    SpanBuffer buffer{payload};
+    std::istream file{&buffer};
+    file.exceptions(std::ios::failbit);
+    const std::streampos end{static_cast<std::streamoff>(payload.size())};
+    u32 num_envs{};
+    file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+    if (num_envs == 0 || num_envs > Maxwell::MaxShaderProgram) {
+        throw std::ios_base::failure("Invalid number of shader environments");
+    }
+    const auto load = [&payload]<typename T>(T& value, size_t offset) {
+        std::memcpy(&value, payload.data() + offset, sizeof(T));
+    };
+    ReplacedPipelineCode result;
+    size_t copied{};
+    for (u32 index = 0; index < num_envs; ++index) {
+        const auto begin = static_cast<size_t>(std::streamoff{file.tellg()});
+        FileEnvironment env;
+        env.Deserialize(file, end);
+        const auto env_end = static_cast<size_t>(std::streamoff{file.tellg()});
+        u64 code_size{};
+        u32 texture_bound{};
+        u32 read_lowest{};
+        load(code_size, begin);
+        load(texture_bound, begin + TextureBoundOffset);
+        load(read_lowest, begin + ReadHighestOffset - sizeof(u32));
+        std::vector<u64> code(static_cast<size_t>(code_size / sizeof(u64)));
+        std::memcpy(code.data(), payload.data() + begin + CodeOffset, code.size() * sizeof(u64));
+        const u64 hash{NativeShaderHash(code)};
+        const auto replacement =
+            env.IsNativeProgram() ? replace(hash, texture_bound) : std::nullopt;
+        if (!replacement || replacement->code.empty()) {
+            result.shader_hashes.emplace_back(hash, hash);
+            continue;
+        }
+        const auto store = [&result]<typename T>(const T& value, size_t offset) {
+            std::memcpy(result.payload.data() + offset, &value, sizeof(T));
+        };
+        result.payload.insert(result.payload.end(), payload.begin() + copied,
+                              payload.begin() + begin + CodeOffset);
+        const size_t header{result.payload.size() - CodeOffset};
+        const u64 new_size{replacement->code.size_bytes()};
+        store(new_size, header);
+        store(replacement->texture_bound, header + TextureBoundOffset);
+        store(static_cast<u32>(read_lowest + new_size - sizeof(u64)), header + ReadHighestOffset);
+        const auto* const new_code = reinterpret_cast<const u8*>(replacement->code.data());
+        result.payload.insert(result.payload.end(), new_code, new_code + new_size);
+        copied = begin + CodeOffset + static_cast<size_t>(code_size);
+        result.payload.insert(result.payload.end(), payload.begin() + copied,
+                              payload.begin() + env_end);
+        copied = env_end;
+        result.shader_hashes.emplace_back(hash, NativeShaderHash(replacement->code));
+    }
+    if (copied == 0) {
+        result.payload.assign(payload.begin(), payload.end());
+    } else {
+        result.payload.insert(result.payload.end(), payload.begin() + copied, payload.end());
+    }
+    return result;
+}
+
+bool ReadPipelinesUnchanged(
+    const std::filesystem::path& filename, u32 cache_version,
+    Common::UniqueFunction<void, std::istream&, FileEnvironment> load_compute,
+    Common::UniqueFunction<void, std::istream&, std::vector<FileEnvironment>> load_graphics) {
+    std::ifstream file(filename, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        return false;
+    }
+    const std::streampos end{file.tellg()};
+    file.seekg(0, std::ios::beg);
+    std::array<char, 8> magic_number{};
+    u32 version{};
+    file.read(magic_number.data(), magic_number.size())
+        .read(reinterpret_cast<char*>(&version), sizeof(version));
+    if (!file || magic_number != MAGIC_NUMBER || version != cache_version) {
+        return false;
+    }
+    file.exceptions(std::ifstream::failbit);
+    try {
+        while (file.tellg() != end) {
+            ReadPipelineEnvironments(file, end, load_compute, load_graphics);
+        }
+    } catch (const std::bad_alloc& e) {
+        LOG_ERROR(Common_Filesystem, "Stopped reading pipeline cache file {}: {}",
+                  Common::FS::PathToUTF8String(filename), e.what());
+    } catch (const std::ios_base::failure& e) {
+        LOG_WARNING(Common_Filesystem, "Stopped reading pipeline cache file {} at a damaged record: {}",
+                    Common::FS::PathToUTF8String(filename), e.what());
+    }
+    return true;
+}
+
+PipelineRecord ReadPipelineRecord(std::istream& file, u64 begin) {
     const u64 end{static_cast<u64>(std::streamoff{file.tellg()})};
     std::vector<char> bytes(static_cast<size_t>(end - begin));
     file.seekg(static_cast<std::streamoff>(begin));

@@ -394,6 +394,8 @@ struct Info {
     /// and storage buffer words (see EvaluateHandleProgram), evaluated for each draw.
     std::vector<std::vector<u32>> handle_programs;
     ImageDescriptors image_descriptors;
+
+    bool operator==(const Info&) const = default;
 };
 
 template <typename Descriptors>

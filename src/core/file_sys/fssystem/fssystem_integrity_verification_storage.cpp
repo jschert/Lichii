@@ -63,24 +63,23 @@ size_t IntegrityVerificationStorage::Read(u8* buffer, size_t size, size_t offset
     ASSERT(buffer != nullptr);
 
     // Validate the offset.
-    s64 data_size = m_data_storage->GetSize();
-    ASSERT(offset <= static_cast<size_t>(data_size));
+    const size_t data_size = m_data_storage->GetSize();
+    if (offset > data_size) {
+        return 0;
+    }
 
     // Validate the access range.
-    ASSERT(R_SUCCEEDED(IStorage::CheckAccessRange(
-        offset, size, Common::AlignUp(data_size, static_cast<size_t>(m_verification_block_size)))));
+    if (R_FAILED(IStorage::CheckAccessRange(
+            offset, size, Common::AlignUp(data_size, static_cast<size_t>(m_verification_block_size))))) {
+        return 0;
+    }
 
     // Determine the read extents.
     size_t read_size = size;
-    if (static_cast<s64>(offset + read_size) > data_size) {
-        // Determine the padding sizes.
-        s64 padding_offset = data_size - offset;
-        size_t padding_size = static_cast<size_t>(
-            m_verification_block_size - (padding_offset & (m_verification_block_size - 1)));
-        ASSERT(static_cast<s64>(padding_size) < m_verification_block_size);
-
-        // Clear the padding.
-        std::memset(static_cast<u8*>(buffer) + padding_offset, 0, padding_size);
+    if (offset + read_size > data_size) {
+        // Zero the requested bytes past the end of the data.
+        const size_t padding_offset = data_size - offset;
+        std::memset(buffer + padding_offset, 0, size - padding_offset);
 
         // Set the new in-bounds size.
         read_size = static_cast<size_t>(data_size - offset);

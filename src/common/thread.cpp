@@ -984,4 +984,81 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
 }
 #endif
 
+#ifdef _WIN32
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+Event::~Event() {
+    if (sleep_wake) {
+        CloseHandle(sleep_wake);
+    }
+}
+
+void Event::WakeSleeper() {
+    SetEvent(sleep_wake);
+}
+
+// Timer and wake event as in Eglantine #538 (a51de161ed, pretend7979): a high-resolution timer
+// can expire between timer-resolution ticks.
+bool Event::SleepFor(const std::chrono::nanoseconds time) {
+    struct Timer {
+        Timer() {
+            handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                            TIMER_ALL_ACCESS);
+            if (!handle) {
+                handle = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+            }
+        }
+        ~Timer() {
+            if (handle) {
+                CloseHandle(handle);
+            }
+        }
+        HANDLE handle;
+    };
+    static thread_local Timer timer;
+    using TimerTicks = std::chrono::duration<s64, std::ratio<1, 10'000'000>>;
+
+    std::unique_lock lk{mutex};
+    const auto deadline = std::chrono::steady_clock::time_point{EventWaitDeadline(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()), time)};
+    if (!sleep_wake) {
+        sleep_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    }
+    while (!is_set.load()) {
+        const auto remaining = deadline - std::chrono::steady_clock::now();
+        if (remaining <= std::chrono::nanoseconds::zero()) {
+            return false;
+        }
+        LARGE_INTEGER due{};
+        due.QuadPart = -std::chrono::ceil<TimerTicks>(remaining).count();
+        if (!sleep_wake || !timer.handle ||
+            !SetWaitableTimerEx(timer.handle, &due, 0, nullptr, nullptr, nullptr, 0)) {
+            condvar.wait_until(lk, deadline, [this] { return is_set.load(); });
+            continue;
+        }
+        // Set() signals sleep_wake while a sleeper waits; the timeout only backs up the timer.
+        ++sleepers;
+        lk.unlock();
+        const HANDLE handles[]{static_cast<HANDLE>(sleep_wake), timer.handle};
+        const auto backstop = std::chrono::ceil<std::chrono::milliseconds>(remaining).count() + 1;
+        const DWORD result = WaitForMultipleObjects(
+            2, handles, FALSE, static_cast<DWORD>((std::min<s64>)(backstop, INFINITE - 1)));
+        lk.lock();
+        --sleepers;
+        if (result == WAIT_FAILED) {
+            condvar.wait_until(lk, deadline, [this] { return is_set.load(); });
+        }
+    }
+    is_set = false;
+    return true;
+}
+#else
+bool Event::SleepFor(const std::chrono::nanoseconds time) {
+    return WaitFor(time);
+}
+#endif
+
 } // namespace Common

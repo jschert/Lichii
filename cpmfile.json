@@ -353,6 +353,11 @@
         "repo": "herumi/xbyak",
         "version": "v7.40.1"
     },
+    "xxhash": {
+        "hash": "8b5c8b9aad4e869f28310b12cc314037feda81d92f26c23eaecdb35dc65042ca2e65f2e9606033e62a31bcc737a9a950500ffcbdb8677d6ab20e820ea14f2b79",
+        "repo": "Cyan4973/xxHash",
+        "version": "v0.8.3"
+    },
     "zbic": {
         "hash": "fbe2f37986377d7f0d96ae3224c80b5971df6e8b6961f68061f1975ebb2e8cb78f07b90f014b007be4023dbf5513581504e7f7d61a5237cb2a8a7a61ae11e482",
         "repo": "kinnay/zbic",

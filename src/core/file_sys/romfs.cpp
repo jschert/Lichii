@@ -5,9 +5,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <memory>
+#include <optional>
 
-#include "common/assert.h"
 #include "common/common_types.h"
+#include "common/logging.h"
 #include "common/string_util.h"
 #include "common/swap.h"
 #include "core/file_sys/fsmitm_romfsbuild.h"
@@ -21,6 +22,9 @@
 namespace FileSys {
 namespace {
 constexpr u32 ROMFS_ENTRY_EMPTY = 0xFFFFFFFF;
+// Each level adds at least two characters to a path, and Horizon paths hold 0x300 of them. The
+// limit also bounds the destructor recursion of the extracted tree.
+constexpr size_t MaxDirectoryDepth = 0x300 / 2;
 
 struct TableLocation {
     u64_le offset;
@@ -63,68 +67,81 @@ struct RomFSTraversalContext {
     VirtualFile file;
     std::vector<u8> directory_meta;
     std::vector<u8> file_meta;
+    // A valid RomFS links every entry once, so an entry reached twice means the links loop.
+    std::vector<bool> directory_seen;
+    std::vector<bool> file_seen;
 };
 
-template <typename EntryType, auto Member>
-std::pair<EntryType, std::string> GetEntry(const RomFSTraversalContext& ctx, size_t offset) {
-    const size_t entry_end = offset + sizeof(EntryType);
-    const std::vector<u8>& vec = ctx.*Member;
-    const size_t size = vec.size();
-    const u8* data = vec.data();
+template <typename EntryType>
+std::optional<std::pair<EntryType, std::string>> GetEntry(const std::vector<u8>& meta,
+                                                          std::vector<bool>& seen, u32 offset) {
+    if (offset >= meta.size() || meta.size() - offset < sizeof(EntryType) || seen[offset]) {
+        return std::nullopt;
+    }
+    seen[offset] = true;
+
     EntryType entry{};
+    std::memcpy(&entry, meta.data() + offset, sizeof(EntryType));
 
-    if (entry_end > size) {
-        return {};
-    }
-    std::memcpy(&entry, data + offset, sizeof(EntryType));
+    const size_t name_offset = offset + sizeof(EntryType);
+    const size_t name_length = (std::min<size_t>)(entry.name_length, meta.size() - name_offset);
+    std::string name(reinterpret_cast<const char*>(meta.data() + name_offset), name_length);
 
-    const size_t name_length = (std::min)(entry_end + entry.name_length, size) - entry_end;
-    std::string name(reinterpret_cast<const char*>(data + entry_end), name_length);
-
-    return {entry, std::move(name)};
+    return std::pair{entry, std::move(name)};
 }
 
-std::pair<DirectoryEntry, std::string> GetDirectoryEntry(const RomFSTraversalContext& ctx,
-                                                         size_t directory_offset) {
-    return GetEntry<DirectoryEntry, &RomFSTraversalContext::directory_meta>(ctx, directory_offset);
-}
-
-std::pair<FileEntry, std::string> GetFileEntry(const RomFSTraversalContext& ctx,
-                                               size_t file_offset) {
-    return GetEntry<FileEntry, &RomFSTraversalContext::file_meta>(ctx, file_offset);
-}
-
-void ProcessFile(const RomFSTraversalContext& ctx, u32 this_file_offset,
-                 std::shared_ptr<VectorVfsDirectory>& parent) {
-    while (this_file_offset != ROMFS_ENTRY_EMPTY) {
-        auto entry = GetFileEntry(ctx, this_file_offset);
-
-        parent->AddFile(std::make_shared<OffsetVfsFile>(ctx.file, entry.first.size,
-                                                        entry.first.offset + ctx.header.data_offset,
-                                                        std::move(entry.second)));
-
-        this_file_offset = entry.first.sibling;
-    }
-}
-
-void ProcessDirectory(const RomFSTraversalContext& ctx, u32 this_dir_offset,
-                      std::shared_ptr<VectorVfsDirectory>& parent) {
-    while (this_dir_offset != ROMFS_ENTRY_EMPTY) {
-        auto entry = GetDirectoryEntry(ctx, this_dir_offset);
-        auto current = std::make_shared<VectorVfsDirectory>(
-            std::vector<VirtualFile>{}, std::vector<VirtualDir>{}, entry.second);
-
-        if (entry.first.child_file != ROMFS_ENTRY_EMPTY) {
-            ProcessFile(ctx, entry.first.child_file, current);
+bool ProcessFiles(RomFSTraversalContext& ctx, u32 file_offset, VectorVfsDirectory& parent) {
+    while (file_offset != ROMFS_ENTRY_EMPTY) {
+        auto entry = GetEntry<FileEntry>(ctx.file_meta, ctx.file_seen, file_offset);
+        if (!entry) {
+            return false;
         }
 
-        if (entry.first.child_dir != ROMFS_ENTRY_EMPTY) {
-            ProcessDirectory(ctx, entry.first.child_dir, current);
+        parent.AddFile(std::make_shared<OffsetVfsFile>(ctx.file, entry->first.size,
+                                                       entry->first.offset + ctx.header.data_offset,
+                                                       std::move(entry->second)));
+
+        file_offset = entry->first.sibling;
+    }
+    return true;
+}
+
+// Walks the directory tree with an explicit stack, since its depth comes from the file.
+bool ProcessDirectories(RomFSTraversalContext& ctx, VectorVfsDirectory& root) {
+    struct Pending {
+        u32 dir_offset;
+        VectorVfsDirectory* parent;
+        size_t depth;
+    };
+    std::vector<Pending> pending{{0, &root, 0}};
+    while (!pending.empty()) {
+        auto [dir_offset, parent, depth] = pending.back();
+        pending.pop_back();
+        if (depth > MaxDirectoryDepth) {
+            return false;
         }
 
-        parent->AddDirectory(current);
-        this_dir_offset = entry.first.sibling;
+        while (dir_offset != ROMFS_ENTRY_EMPTY) {
+            auto entry = GetEntry<DirectoryEntry>(ctx.directory_meta, ctx.directory_seen, dir_offset);
+            if (!entry) {
+                return false;
+            }
+
+            auto current = std::make_shared<VectorVfsDirectory>(
+                std::vector<VirtualFile>{}, std::vector<VirtualDir>{}, std::move(entry->second));
+            parent->AddDirectory(current);
+
+            if (!ProcessFiles(ctx, entry->first.child_file, *current)) {
+                return false;
+            }
+            if (entry->first.child_dir != ROMFS_ENTRY_EMPTY) {
+                pending.push_back({entry->first.child_dir, current.get(), depth + 1});
+            }
+
+            dir_offset = entry->first.sibling;
+        }
     }
+    return true;
 }
 } // Anonymous namespace
 
@@ -148,14 +165,24 @@ VirtualDir ExtractRomFS(VirtualFile file) {
     ctx.directory_meta =
         file->ReadBytes(ctx.header.directory_meta.size, ctx.header.directory_meta.offset);
     ctx.file_meta = file->ReadBytes(ctx.header.file_meta.size, ctx.header.file_meta.offset);
+    if (ctx.directory_meta.size() != ctx.header.directory_meta.size ||
+        ctx.file_meta.size() != ctx.header.file_meta.size) {
+        LOG_ERROR(Loader, "RomFS directory or file table runs past the end of the file");
+        return nullptr;
+    }
+    ctx.directory_seen.resize(ctx.directory_meta.size());
+    ctx.file_seen.resize(ctx.file_meta.size());
 
-    ProcessDirectory(ctx, 0, root_container);
+    if (!ProcessDirectories(ctx, *root_container)) {
+        LOG_ERROR(Loader, "RomFS directory or file tables are malformed");
+        return nullptr;
+    }
 
     if (auto root = root_container->GetSubdirectory(""); root) {
         return root;
     }
 
-    ASSERT(false);
+    LOG_ERROR(Loader, "RomFS root directory has a name");
     return nullptr;
 }
 

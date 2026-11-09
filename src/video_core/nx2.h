@@ -9,6 +9,10 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <shared_mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -127,36 +131,140 @@ inline void Nx2ClearGpuWrittenPages() {
     return false;
 }
 
-inline constexpr size_t Nx2MaxSemaphoreRegions = 32;
-inline std::array<std::atomic<u64>, Nx2MaxSemaphoreRegions> g_nx2_semaphore_regions{}; // starts
+// NVN2 queues release their progress values into the second page of a two-page GPU-accessible
+// region and GPU acquires read the same offsets in the first page (the CPU polls the second).
+// Something on the console copies one into the other; until that is known, the puller mirrors
+// releases that land in a second page. Every queue has such a region, and games make well over
+// 32 of them. Region starts are page aligned, so a lookup is one hash probe.
+inline std::shared_mutex g_nx2_semaphore_regions_mutex;
+inline std::unordered_set<u64> g_nx2_semaphore_regions; // starts
 
 inline void Nx2AddSemaphoreRegion(u64 start) {
-    for (auto& region : g_nx2_semaphore_regions) {
-        if (region.load() == start) {
-            return;
-        }
-    }
-    for (auto& region : g_nx2_semaphore_regions) {
-        u64 expected = 0;
-        if (region.compare_exchange_strong(expected, start)) {
-            return;
-        }
-    }
+    std::unique_lock lock{g_nx2_semaphore_regions_mutex};
+    g_nx2_semaphore_regions.insert(start);
 }
 
 /// The region's memory was destroyed: stop mirroring into it.
 inline void Nx2RemoveSemaphoreRegion(u64 start) {
-    for (auto& region : g_nx2_semaphore_regions) {
-        u64 expected = start;
-        region.compare_exchange_strong(expected, 0);
-    }
+    std::unique_lock lock{g_nx2_semaphore_regions_mutex};
+    g_nx2_semaphore_regions.erase(start);
 }
+
+[[nodiscard]] inline bool Nx2IsSemaphoreRegion(u64 start) {
+    std::shared_lock lock{g_nx2_semaphore_regions_mutex};
+    return g_nx2_semaphore_regions.contains(start);
+}
+
+inline bool Nx2InSemaphoreFirstPage(u64 address) {
+    return Nx2IsSemaphoreRegion(address & ~u64{0xfff});
+}
+
+/// Some first-page words also get direct releases of their own counter (a queue's fence at
+/// offset 0). A mirrored release into such a word would show the guest CPU another counter's
+/// progress, so its waits end before the work they wait for has run. Mirrored releases into
+/// those words go to this table instead, and only GPU acquires read it. Words only the mirror
+/// writes keep getting guest memory writes. Keyed by device word address. Ported from
+/// jpasqui/Eglantine f8941169650 and ca73069b2e.
+class Nx2MirrorShadow {
+public:
+    static Nx2MirrorShadow& Get() {
+        static Nx2MirrorShadow instance;
+        return instance;
+    }
+
+    /// A release that is not the mirror's landed at gpu_address (device_address).
+    void NoteDirectRelease(u64 device_address, u64 gpu_address) {
+        if (!Nx2InSemaphoreFirstPage(gpu_address)) {
+            return;
+        }
+        const u64 word = device_address & ~u64{3};
+        std::scoped_lock lock{mutex};
+        if (direct_words.size() < MaxDirectWords) {
+            direct_words.insert(word);
+            has_direct.store(true, std::memory_order_release);
+        }
+        words.erase(word);
+    }
+
+    /// A direct release that combines with the word it lands on (a QMD max or reduction) took guest
+    /// memory from guest_before to guest_after. While the word holds a mirrored value, GPU acquires
+    /// see combine(mirrored), what the word would hold without the shadow. Returns what they see.
+    template <typename Combine>
+    u32 NoteCombinedRelease(u64 device_address, u64 gpu_address, u32 guest_before, u32 guest_after,
+                            Combine&& combine) {
+        const auto mirrored = Read(device_address, guest_before);
+        NoteDirectRelease(device_address, gpu_address);
+        if (!mirrored) {
+            return guest_after;
+        }
+        const u32 seen = combine(*mirrored);
+        Set(device_address, seen, guest_after);
+        return seen;
+    }
+
+    /// Whether a mirrored release into this word goes to the table instead of guest memory.
+    bool Diverts(u64 device_address) const {
+        if (!has_direct.load(std::memory_order_acquire)) {
+            return false;
+        }
+        std::scoped_lock lock{mutex};
+        return direct_words.contains(device_address & ~u64{3});
+    }
+
+    /// guest: what guest memory holds at the word now.
+    void Set(u64 device_address, u32 value, u32 guest) {
+        std::scoped_lock lock{mutex};
+        words.insert_or_assign(device_address & ~u64{3}, Word{value, guest});
+        has_words.store(true, std::memory_order_release);
+    }
+
+    /// The mirrored value of a word whose guest memory holds guest, or none. Once the guest word
+    /// changed (a direct release or a CPU write), it is newer than the mirrored value.
+    std::optional<u32> Read(u64 device_address, u32 guest) {
+        if (!has_words.load(std::memory_order_acquire)) {
+            return std::nullopt;
+        }
+        std::scoped_lock lock{mutex};
+        const auto it = words.find(device_address & ~u64{3});
+        if (it == words.end()) {
+            return std::nullopt;
+        }
+        if (it->second.guest != guest) {
+            words.erase(it);
+            return std::nullopt;
+        }
+        return it->second.value;
+    }
+
+    void Clear() {
+        std::scoped_lock lock{mutex};
+        direct_words.clear();
+        words.clear();
+        has_direct.store(false, std::memory_order_release);
+        has_words.store(false, std::memory_order_release);
+    }
+
+private:
+    struct Word {
+        u32 value;
+        u32 guest;
+    };
+    static constexpr size_t MaxDirectWords = 1024;
+
+    mutable std::mutex mutex;
+    std::atomic<bool> has_direct{};
+    std::atomic<bool> has_words{};
+    std::unordered_set<u64> direct_words;
+    std::unordered_map<u64, Word> words;
+};
 
 /// A new emulation session starts: no queue has a region yet.
 inline void Nx2ClearSemaphoreRegions() {
-    for (auto& region : g_nx2_semaphore_regions) {
-        region.store(0);
+    {
+        std::unique_lock lock{g_nx2_semaphore_regions_mutex};
+        g_nx2_semaphore_regions.clear();
     }
+    Nx2MirrorShadow::Get().Clear();
 }
 
 // Switch 2 sparse regions (nx2:gpu 214, word 7 bit 0x200: title 1's terrain texture arrays and
@@ -363,26 +471,55 @@ inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
     return true;
 }
 
+/// GPU VA in the first page that mirrors a release at `address`, or 0.
+inline u64 Nx2SemaphoreMirror(u64 address) {
+    return Nx2IsSemaphoreRegion((address & ~u64{0xfff}) - 0x1000) ? address - 0x1000 : 0;
+}
+
 /// Channels suspended on a semaphore acquire. A console channel polls and sees every release;
 /// Eden writes releases in bursts when fences signal and resumes waiters only between command
 /// lists, so an acquire-equal could miss its value. Writes latch the waiters they satisfy.
+/// The channels' acquires (Add, Remove, Latched) all run on the GPU thread (the split's front);
+/// writes (OnWrite) come from the thread that runs the engines. Latched takes no lock: a waiter
+/// polls its own slot, which only its own thread fills and empties.
 class Nx2SemaphoreWaiters {
 public:
     // Puller GpuSemaphoreOperation values.
     static constexpr u32 AcquireEqual = 0x1;
     static constexpr u32 AcquireGequal = 0x4;
     static constexpr u32 AcquireMask = 0x8;
+    /// One per channel suspended at once.
+    static constexpr size_t MaxWaiters = 64;
 
     static Nx2SemaphoreWaiters& Get() {
         static Nx2SemaphoreWaiters waiters;
         return waiters;
     }
 
-    void Add(const void* owner, u64 device_address, u32 value, u32 operation) {
+    /// False, and nothing is latched for owner, when MaxWaiters others wait already.
+    bool Add(const void* owner, u64 device_address, u32 value, u32 operation) {
         std::scoped_lock lk{mutex};
-        std::erase_if(waiters, [owner](const Waiter& w) { return w.owner == owner; });
-        waiters.push_back({owner, device_address, value, operation, false});
-        count.store(waiters.size(), std::memory_order_release);
+        Slot* free_slot = nullptr;
+        for (Slot& slot : slots) {
+            const void* const current = slot.owner.load(std::memory_order_relaxed);
+            if (current == owner) {
+                slot.owner.store(nullptr, std::memory_order_relaxed);
+                count.fetch_sub(1, std::memory_order_relaxed);
+            }
+            if ((current == nullptr || current == owner) && free_slot == nullptr) {
+                free_slot = &slot;
+            }
+        }
+        if (free_slot == nullptr) {
+            return false;
+        }
+        free_slot->address = device_address;
+        free_slot->value = value;
+        free_slot->operation = operation;
+        free_slot->latched.store(false, std::memory_order_relaxed);
+        free_slot->owner.store(owner, std::memory_order_relaxed);
+        count.fetch_add(1, std::memory_order_release);
+        return true;
     }
 
     void Remove(const void* owner) {
@@ -390,56 +527,65 @@ public:
             return;
         }
         std::scoped_lock lk{mutex};
-        std::erase_if(waiters, [owner](const Waiter& w) { return w.owner == owner; });
-        count.store(waiters.size(), std::memory_order_release);
+        for (Slot& slot : slots) {
+            if (slot.owner.load(std::memory_order_relaxed) == owner) {
+                slot.owner.store(nullptr, std::memory_order_relaxed);
+                count.fetch_sub(1, std::memory_order_relaxed);
+            }
+        }
     }
 
-    [[nodiscard]] bool Latched(const void* owner) {
+    [[nodiscard]] bool Latched(const void* owner) const {
         if (count.load(std::memory_order_acquire) == 0) {
             return false;
         }
-        std::scoped_lock lk{mutex};
-        return std::ranges::any_of(waiters,
-                                   [owner](const Waiter& w) { return w.owner == owner && w.latched; });
+        for (const Slot& slot : slots) {
+            if (slot.owner.load(std::memory_order_relaxed) == owner) {
+                // Acquire: what the engine wrote before the latch is visible after it.
+                return slot.latched.load(std::memory_order_acquire);
+            }
+        }
+        return false;
     }
 
-    /// A GPU write of `value` to the u32 at `device_address`.
+    /// A GPU write of value to the u32 at device_address.
     void OnWrite(u64 device_address, u32 value) {
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
         std::scoped_lock lk{mutex};
-        for (auto& w : waiters) {
-            if (w.address == device_address && !w.latched && Matches(w, value)) {
-                w.latched = true;
+        for (Slot& slot : slots) {
+            if (slot.owner.load(std::memory_order_relaxed) != nullptr &&
+                slot.address == device_address && Matches(slot, value)) {
+                slot.latched.store(true, std::memory_order_release);
             }
         }
     }
 
 private:
-    struct Waiter {
-        const void* owner;
-        u64 address;
-        u32 value;
-        u32 operation;
-        bool latched;
+    struct Slot {
+        std::atomic<const void*> owner{};
+        u64 address{};
+        u32 value{};
+        u32 operation{};
+        std::atomic<bool> latched{};
     };
 
-    static bool Matches(const Waiter& w, u32 current) {
-        switch (w.operation) {
+    static bool Matches(const Slot& slot, u32 current) {
+        switch (slot.operation) {
         case AcquireEqual:
-            return current == w.value;
+            return current == slot.value;
         case AcquireGequal:
-            return current >= w.value;
+            return current >= slot.value;
         case AcquireMask:
-            return (current & w.value) != 0;
+            return (current & slot.value) != 0;
         default:
             return false;
         }
     }
 
-    std::mutex mutex;
-    std::vector<Waiter> waiters;
+    std::mutex mutex; ///< Held to fill, empty and latch slots
+    std::array<Slot, MaxWaiters> slots{};
     std::atomic<size_t> count{};
 };
 

@@ -390,9 +390,10 @@ jobs:
           set -euo pipefail
           test -x build/release/bin/lichii
           test -x build/release/bin/eden-cli
+          test -f build/release/bin/libnxformat.so
           strip build/release/bin/lichii build/release/bin/eden-cli
           tar -czf "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz" \
-            -C build/release/bin lichii eden-cli nx2_switches.txt
+            -C build/release/bin lichii eden-cli nx2_switches.txt libnxformat.so
           ls -la "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz"
 
       # A self-contained AppImage: linuxdeploy bundles every library the two programs need except
@@ -450,8 +451,9 @@ jobs:
           windeployqt --release --no-translations build/release/bin/lichii.exe
 
       # A self-contained app bundle: macdeployqt copies Qt and every other Homebrew library both
-      # programs load into the bundle, then the leftover Homebrew search paths are removed so a
-      # machine with Homebrew still uses the bundled copies. Ad-hoc signed, not notarized.
+      # programs load into the bundle, then the leftover Homebrew and build-tree search paths are
+      # removed so a machine with Homebrew still uses the bundled copies. Ad-hoc signed, not
+      # notarized.
       - name: Package macOS app
         if: startsWith(matrix.platform, 'macos')
         shell: bash
@@ -470,7 +472,8 @@ jobs:
             -exec sh -c 'file -b "$1" | grep -q Mach-O' _ {} \; -print)
           for binary in $binaries; do
             otool -l "$binary" | awk '/cmd LC_RPATH/ {getline; getline; print $2}' |
-              { grep -E '^/(opt/homebrew|usr/local)/' || true; } | while read -r rpath; do
+              { grep -E -e '^/(opt/homebrew|usr/local)/' -e "^$GITHUB_WORKSPACE/" || true; } |
+              while read -r rpath; do
                 install_name_tool -delete_rpath "$rpath" "$binary" 2> /dev/null
               done
           done
@@ -480,9 +483,9 @@ jobs:
               "$app/Contents/MacOS/$program" 2> /dev/null
           done
           leaks=$(for binary in $binaries; do
-            otool -L "$binary" | grep -E '^\s+/(opt/homebrew|usr/local)/'
+            otool -L "$binary" | grep -E -e '^\s+/(opt/homebrew|usr/local)/' -e "^\s+$GITHUB_WORKSPACE/"
             otool -l "$binary" | awk '/cmd LC_RPATH/ {getline; getline; print $2}' |
-              grep -E '^/(opt/homebrew|usr/local)/'
+              grep -E -e '^/(opt/homebrew|usr/local)/' -e "^$GITHUB_WORKSPACE/"
           done || true)
           if [ -n "$leaks" ]; then
             echo "References still pointing outside the bundle:"
@@ -498,6 +501,64 @@ jobs:
             codesign --force --sign - --entitlements dist/eglantine.entitlements "$app"
           fi
           codesign --verify --deep --strict "$app"
+          # libnxformat must resolve inside the bundle: lichii names it through @rpath,
+          # @executable_path or @loader_path (as macdeployqt rewrites it), every LC_RPATH of lichii
+          # is bundle-relative, the dylib is where they point, and the dylib itself depends only on
+          # @rpath and system libraries.
+          exe="$app/Contents/MacOS/lichii"
+          echo "otool -L lichii:"; otool -L "$exe"
+          rpaths=$(otool -l "$exe" | awk '/cmd LC_RPATH/ {getline; getline; print $2}')
+          echo "LC_RPATH lichii:"; echo "$rpaths"
+          ref=$(otool -L "$exe" | awk '/libnxformat\.dylib/ {print $1}')
+          case "$ref" in
+            @rpath/*|@executable_path/*|@loader_path/*) ;;
+            *) echo "::error::lichii references libnxformat as '$ref'"; exit 1 ;;
+          esac
+          for rpath in $rpaths; do
+            case "$rpath" in
+              @executable_path*|@loader_path*) ;;
+              *) echo "::error::lichii has an LC_RPATH outside the bundle: $rpath"; exit 1 ;;
+            esac
+          done
+          dylib=
+          if [[ $ref == @rpath/* ]]; then
+            for rpath in $rpaths; do
+              dir=${rpath/#@executable_path/$app/Contents/MacOS}
+              dir=${dir/#@loader_path/$app/Contents/MacOS}
+              if [ -z "$dylib" ] && [ -f "$dir/${ref#@rpath/}" ]; then
+                dylib="$dir/${ref#@rpath/}"
+              fi
+            done
+          else
+            target=${ref/#@executable_path/$app/Contents/MacOS}
+            target=${target/#@loader_path/$app/Contents/MacOS}
+            if [ -f "$target" ]; then
+              dylib=$target
+            fi
+          fi
+          if [ -z "$dylib" ]; then
+            echo "::error::$ref does not resolve inside lichii.app"
+            exit 1
+          fi
+          echo "libnxformat resolves to $dylib"
+          echo "otool -L libnxformat:"; otool -arch arm64 -L "$dylib"
+          echo "LC_RPATH libnxformat:"
+          otool -arch arm64 -l "$dylib" | awk '/cmd LC_RPATH/ {getline; getline; print $2}'
+          outside=$(otool -arch arm64 -L "$dylib" | tail -n +2 | awk '{print $1}' |
+            grep -vE '^(@rpath/|@executable_path/|@loader_path/|/usr/lib/|/System/Library/)' || true)
+          if [ -n "$outside" ]; then
+            echo "::error::libnxformat.dylib depends on libraries outside the bundle: $outside"
+            exit 1
+          fi
+          # Advisory: start the app for 20 s and look for dyld loading libnxformat from the bundle.
+          status=0
+          DYLD_PRINT_LIBRARIES=1 QT_QPA_PLATFORM=offscreen \
+            perl -e 'alarm 20; exec @ARGV' "$exe" > launch.log 2>&1 || status=$?
+          echo "launch exit status: $status"
+          if ! grep -E 'lichii\.app/Contents/.*libnxformat\.dylib' launch.log; then
+            echo "::warning::the launch check did not see libnxformat.dylib load from lichii.app"
+            tail -n 40 launch.log || true
+          fi
           ditto -c -k --keepParent "$app" "lichii-${GITHUB_SHA}-${{ matrix.platform }}.zip"
           ls -la "lichii-${GITHUB_SHA}-${{ matrix.platform }}.zip"
           # Also ship a .dmg (drag lichii.app onto Applications).

@@ -50,6 +50,9 @@ Result NcaReader::Initialize(VirtualFile base_storage, const NcaCryptoConfigurat
     // We need to be able to generate keys.
     R_UNLESS(crypto_cfg.generate_key != nullptr, ResultInvalidArgument);
 
+    // The header must be there to read.
+    R_UNLESS(base_storage->GetSize() >= sizeof(NcaHeader), ResultInvalidNcaHeader);
+
     // Generate keys for header.
     using AesXtsStorageForNcaHeader = AesXtsStorage;
 
@@ -84,9 +87,11 @@ Result NcaReader::Initialize(VirtualFile base_storage, const NcaCryptoConfigurat
 
     // Validate the magic.
     if (const Result magic_result = CheckNcaMagic(m_header.magic); R_FAILED(magic_result)) {
-        // Try to use a plaintext header.
+        // Try to use a plaintext header, as a decrypted NCA (DNCA magic) has.
         base_storage->ReadObject(std::addressof(m_header), 0);
-        R_UNLESS(R_SUCCEEDED(CheckNcaMagic(m_header.magic)), magic_result);
+        R_UNLESS(m_header.magic == NcaHeader::MagicDecrypted ||
+                     R_SUCCEEDED(CheckNcaMagic(m_header.magic)),
+                 magic_result);
 
         // Configure to use the plaintext header.
         auto base_storage_size = base_storage->GetSize();
@@ -360,7 +365,8 @@ Result NcaReader::ReadHeader(NcaFsHeader* dst, s32 index) const {
     ASSERT(0 <= index && index < NcaHeader::FsCountMax);
 
     const s64 offset = sizeof(NcaHeader) + sizeof(NcaFsHeader) * index;
-    m_header_storage->ReadObject(dst, offset);
+    R_UNLESS(m_header_storage->ReadObject(dst, offset) == sizeof(NcaFsHeader),
+             ResultInvalidNcaFsHeader);
 
     R_SUCCEED();
 }

@@ -79,9 +79,13 @@ public:
         u32 operation;
         std::chrono::steady_clock::time_point since;
         std::chrono::steady_clock::time_point last_fences; ///< When it last released fences
-        bool reported;
+        /// When an unmet poll last drained (CanResumeAcquire)
+        std::chrono::steady_clock::time_point last_drain;
+        bool reported; ///< The 2 s warning was logged
 
         [[nodiscard]] bool Matches(u32 current) const;
+        /// Whether it waits for the word to reach `value` (greater or equal).
+        [[nodiscard]] bool WaitsToReach() const;
     };
 
     [[nodiscard]] bool HasPendingAcquire() const {
