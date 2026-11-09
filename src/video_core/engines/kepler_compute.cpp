@@ -1081,12 +1081,15 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     }
     const bool output_replaced = bypass->output_replaced.load(std::memory_order_relaxed);
     // This dispatch feeds only the AA network. Skip it only after the previous frame's output was
-    // successfully replaced; on the first frame or after a failed copy, keep it native. Opt-in
-    // for A/B (EDEN_NX2_OOT_SKIP_HEAVY_DISPATCH=1): the dispatch looks unused (its result feeds
-    // only the network we replace), but skipping it showed intermittent ~40 ms frames and one
-    // presentation freeze at the title screen in testing, so it is not proven safe yet.
-    static const bool skip_unused_dispatch =
-        std::getenv("EDEN_NX2_OOT_SKIP_HEAVY_DISPATCH") != nullptr;
+    // successfully replaced; on the first frame or after a failed copy, keep it native.
+    // Opt-in for A/B (EDEN_NX2_OOT_SKIP_HEAVY_DISPATCH=1): the dispatch looks unused (its result
+    // feeds only the network we replace), but skipping it showed intermittent ~40 ms frames and
+    // one presentation freeze at the title screen in testing, so it is not proven safe yet.
+    // Only an explicit 1 enables it (the repo's switches take a leading 0 as off).
+    static const bool skip_unused_dispatch = [] {
+        const char* value = std::getenv("EDEN_NX2_OOT_SKIP_HEAVY_DISPATCH");
+        return value != nullptr && value[0] == '1';
+    }();
     if (skip_unused_dispatch && ShouldSkipUnusedDispatch(native_key, output_replaced)) {
         return true;
     }
