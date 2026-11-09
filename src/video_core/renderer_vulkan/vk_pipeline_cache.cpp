@@ -26,6 +26,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/memory_detect.h"
+#include "common/settings.h"
 #include "common/thread.h"
 #include "common/thread_worker.h"
 #include "core/core.h"
@@ -788,31 +789,18 @@ bool PreloadAllPipelines() {
 constexpr u64 EvictAfterFrames = 9000;
 
 /// Built graphics pipelines kept before unused ones are destroyed, for a session that loaded
-/// `cached_at_boot` pipelines from the disk cache; 0 is the old eviction (Android, or
-/// EDEN_NX2_KEPT_PIPELINES=0): every pipeline unused for EvictAfterFrames is destroyed except up to
-/// MaxUnusedPrebuiltPipelines prebuilt ones no draw has used. EDEN_NX2_KEPT_PIPELINES=<n> sets the
-/// limit on desktop; otherwise it fits the disk cache (KeptPipelinesForCache), up to a cap that
-/// grows with the machine's RAM (MaxKeptPipelinesForMemory).
+/// `cached_at_boot` pipelines from the disk cache. 0 is the old eviction, used on Android: every
+/// pipeline unused for EvictAfterFrames is destroyed except up to MaxUnusedPrebuiltPipelines
+/// prebuilt ones no draw has used. On desktop the pipeline_eviction_threshold setting sets the
+/// limit; at 0 (automatic) it fits the disk cache (KeptPipelinesForCache), up to a cap that grows
+/// with the machine's RAM (MaxKeptPipelinesForMemory).
 size_t KeptPipelines(size_t cached_at_boot) {
 #ifdef __ANDROID__
     return 0;
 #else
-    static const std::optional<size_t> forced = []() -> std::optional<size_t> {
-        const char* value = std::getenv("EDEN_NX2_KEPT_PIPELINES");
-        if (value == nullptr || value[0] == '\0') {
-            return std::nullopt;
-        }
-        char* end = nullptr;
-        const unsigned long long parsed = std::strtoull(value, &end, 10);
-        if (end == value || *end != '\0' || value[0] == '-') {
-            LOG_WARNING(Render_Vulkan,
-                        "EDEN_NX2_KEPT_PIPELINES={} is not a number, using the default", value);
-            return std::nullopt;
-        }
-        return static_cast<size_t>(parsed);
-    }();
-    if (forced) {
-        return *forced;
+    if (const u32 threshold = Settings::values.pipeline_eviction_threshold.GetValue();
+        threshold != 0) {
+        return threshold;
     }
     static const size_t max_kept =
         MaxKeptPipelinesForMemory(Common::GetMemInfo().TotalPhysicalMemory);

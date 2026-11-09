@@ -226,8 +226,8 @@ private:
     /// built pipelines kept (kept_pipelines).
     void LogEvictionPolicy() const;
     /// Built graphics pipelines kept before unused ones are destroyed (0: the old 9,000-frame
-    /// eviction, see KeptPipelines). Set at
-    /// construction and again once the disk cache has loaded, read on the GPU thread.
+    /// eviction, on Android; see KeptPipelines). Set at construction and again once the disk
+    /// cache has loaded, read on the GPU thread.
     std::atomic<size_t> kept_pipelines{0};
     u64 frame_count{};
     /// Wait budget of native draws for unbuilt pipelines left in this frame, in microseconds

@@ -328,6 +328,14 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Used by the Bounded mode: the most time per frame that Switch 2 draws may wait in "
               "total for pipelines that are still building. Once spent, the remaining unbuilt "
               "draws of that frame are skipped."));
+    INSERT(Settings, pipeline_eviction_threshold, tr("Pipelines kept before eviction:"),
+           tr("How many built graphics pipelines are kept before unused ones are destroyed. A "
+              "destroyed pipeline is built again on the GPU thread the next time it is needed, "
+              "which stutters.\n"
+              "0 (default) sizes it to the shader cache loaded at boot plus 1,024: at least 4,096, "
+              "and at most as many as fit in a quarter of the RAM (about 0.3 MB each). Lower it "
+              "if memory runs short, raise it if going back to visited areas stutters. Applies "
+              "from the next game boot."));
     INSERT(Settings, enable_compute_pipelines, tr("Enable Compute Pipelines (Intel Vulkan Only)"),
            tr("Required by some games.\nThis setting only exists for Intel "
               "proprietary drivers and may crash if enabled.\nCompute pipelines are always enabled "

@@ -668,6 +668,18 @@ struct Values {
                                                          true,
                                                          true};
 
+    // Built graphics pipelines kept before unused ones are destroyed (desktop Vulkan). 0 sizes
+    // the limit to the disk cache loaded at boot and the machine's RAM.
+    SwitchableSetting<u32, true> pipeline_eviction_threshold{linkage,
+                                                             0,
+                                                             0,
+                                                             50000,
+                                                             "pipeline_eviction_threshold",
+                                                             Category::RendererAdvanced,
+                                                             Specialization::Countable,
+                                                             true,
+                                                             false};
+
     // Precache shaders before the game starts: the compute programs in the game files and the
     // cached graphics pipelines the boot leaves for later are built on the loading screen, so the
     // driver's cache holds them before the game first uses them.
