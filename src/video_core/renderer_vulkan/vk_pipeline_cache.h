@@ -275,7 +275,8 @@ private:
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
     void LogEvictionPolicy() const;
-    /// Built graphics pipelines kept before unused ones are destroyed (0: old eviction). Set at
+    /// Built graphics pipelines kept before unused ones are destroyed (0: the old 9,000-frame
+    /// eviction, see KeptPipelines). Set at
     /// construction and again once the disk cache has loaded, read on the GPU thread.
     std::atomic<size_t> kept_pipelines{0};
     u64 frame_count{};

@@ -824,8 +824,9 @@ bool PreloadAllPipelines() {
 constexpr u64 EvictAfterFrames = 9000;
 
 // Built graphics pipelines kept before unused ones are destroyed, for a session that loaded
-// `cached_at_boot` pipelines from the disk cache; 0 destroys every pipeline unused for
-// EvictAfterFrames (Android, or EDEN_NX2_KEPT_PIPELINES=0). EDEN_NX2_KEPT_PIPELINES=<n> sets the
+// `cached_at_boot` pipelines from the disk cache; 0 is the old eviction (Android, or
+// EDEN_NX2_KEPT_PIPELINES=0): every pipeline unused for EvictAfterFrames is destroyed except up to
+// MaxUnusedPrebuiltPipelines prebuilt ones no draw has used. EDEN_NX2_KEPT_PIPELINES=<n> sets the
 // limit on desktop; otherwise it fits the disk cache (KeptPipelinesForCache).
 size_t KeptPipelines(size_t cached_at_boot) {
 #ifdef __ANDROID__

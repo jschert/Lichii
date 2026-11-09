@@ -56,13 +56,6 @@ TEST_CASE("Recently used pipelines count toward the limit but are never picked",
             std::vector<size_t>{0, 1, 2});
 }
 
-TEST_CASE("A limit of 0 evicts every candidate (old behaviour)",
-          "[video_core][pipeline_eviction]") {
-    const std::vector<u64> last_uses{30, 10, 20};
-    REQUIRE(PipelinesToEvict(last_uses, 3, 0) == std::vector<size_t>{0, 1, 2});
-    REQUIRE(PipelinesToEvict(last_uses, 1'000'000, 0).size() == 3);
-}
-
 TEST_CASE("The default limit fits the disk cache loaded at boot",
           "[video_core][pipeline_eviction]") {
     // A small or empty cache keeps the base limit.

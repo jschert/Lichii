@@ -34,20 +34,17 @@ constexpr size_t KeptPipelinesForCache(size_t cached_at_boot) {
 /// @param last_uses Frame each candidate was last used (0 for a prebuilt one no draw has used).
 ///                  Candidates are built pipelines old enough to evict and not the current one.
 /// @param built     Built graphics pipelines in the cache, candidates included.
-/// @param kept      How many built pipelines to keep; 0 destroys every candidate.
-/// @return Indices into `last_uses`: with `kept` 0, every candidate in input order; otherwise the
-///         least recently used first (ties in input order), only as many as it takes to get back
-///         to `kept`, or every candidate when that is not enough.
+/// @param kept      How many built pipelines to keep, non-zero (a limit of 0 is the cache's old
+///                  eviction, which does not use this).
+/// @return Indices into `last_uses`, least recently used first (ties in input order): only as
+///         many as it takes to get back to `kept`, or every candidate when that is not enough.
 inline std::vector<size_t> PipelinesToEvict(std::span<const u64> last_uses, size_t built,
                                             size_t kept) {
-    std::vector<size_t> order(last_uses.size());
-    std::iota(order.begin(), order.end(), size_t{0});
-    if (kept == 0) {
-        return order;
-    }
     if (built <= kept) {
         return {};
     }
+    std::vector<size_t> order(last_uses.size());
+    std::iota(order.begin(), order.end(), size_t{0});
     const size_t count = std::min(built - kept, order.size());
     std::stable_sort(order.begin(), order.end(),
                      [&](size_t a, size_t b) { return last_uses[a] < last_uses[b]; });
