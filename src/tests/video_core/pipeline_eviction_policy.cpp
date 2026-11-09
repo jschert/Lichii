@@ -69,16 +69,22 @@ TEST_CASE("The default limit fits the disk cache loaded at boot",
     static_assert(KeptPipelinesForCache(MaxKeptPipelines) == MaxKeptPipelines);
 }
 
-TEST_CASE("The cap on kept pipelines grows with RAM", "[video_core][pipeline_eviction]") {
+TEST_CASE("The cap on kept pipelines fits a quarter of the RAM and is capped overall",
+          "[video_core][pipeline_eviction]") {
     constexpr u64 GiB = u64{1} << 30;
-    // Up to 16 GiB the cap stays at the fixed one.
-    REQUIRE(MaxKeptPipelinesForMemory(0) == MaxKeptPipelines);
-    REQUIRE(MaxKeptPipelinesForMemory(8 * GiB) == MaxKeptPipelines);
-    REQUIRE(MaxKeptPipelinesForMemory(16 * GiB) == 13981);
-    // 32 GiB fits a quarter of it: OoT's ~15,000-pipeline cache stays built.
-    REQUIRE(MaxKeptPipelinesForMemory(32 * GiB) == 27962);
-    REQUIRE(KeptPipelinesForCache(15'000, MaxKeptPipelinesForMemory(32 * GiB)) == 16'024);
+    // A failed memory query falls back to the conservative base limit.
+    REQUIRE(MaxKeptPipelinesForMemory(0) == DefaultKeptPipelines);
+    // Below 16 GiB the quarter-of-RAM fit is the bound (8 GiB: ~1.9 GiB of pipelines).
+    REQUIRE(MaxKeptPipelinesForMemory(8 * GiB) == 6990);
+    // A 4 GiB machine keeps 3,495, and the base limit never exceeds the memory bound.
+    REQUIRE(MaxKeptPipelinesForMemory(4 * GiB) == 3495);
+    REQUIRE(KeptPipelinesForCache(0, MaxKeptPipelinesForMemory(4 * GiB)) == 3495);
+    REQUIRE(KeptPipelinesForCache(7316, MaxKeptPipelinesForMemory(4 * GiB)) == 3495);
+    // From 16 GiB up, the fixed overall cap applies.
+    REQUIRE(MaxKeptPipelinesForMemory(16 * GiB) == MaxKeptPipelines);
+    REQUIRE(MaxKeptPipelinesForMemory(32 * GiB) == MaxKeptPipelines);
+    REQUIRE(KeptPipelinesForCache(15'000, MaxKeptPipelinesForMemory(32 * GiB)) == MaxKeptPipelines);
     // The cache size still decides below the cap.
     REQUIRE(KeptPipelinesForCache(7316, MaxKeptPipelinesForMemory(32 * GiB)) == 8340);
-    REQUIRE(KeptPipelinesForCache(48'000, MaxKeptPipelinesForMemory(32 * GiB)) == 27962);
+    REQUIRE(KeptPipelinesForCache(48'000, MaxKeptPipelinesForMemory(32 * GiB)) == MaxKeptPipelines);
 }
