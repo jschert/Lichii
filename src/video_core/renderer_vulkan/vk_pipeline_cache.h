@@ -274,6 +274,8 @@ private:
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
+    /// Logs which eviction applies this session: none, the old frame-based one, or the limit of
+    /// built pipelines kept (kept_pipelines).
     void LogEvictionPolicy() const;
     /// Built graphics pipelines kept before unused ones are destroyed (0: the old 9,000-frame
     /// eviction, see KeptPipelines). Set at
