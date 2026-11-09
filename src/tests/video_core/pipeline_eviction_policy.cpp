@@ -8,6 +8,7 @@
 using Vulkan::DefaultKeptPipelines;
 using Vulkan::KeptPipelinesForCache;
 using Vulkan::MaxKeptPipelines;
+using Vulkan::MaxKeptPipelinesForMemory;
 using Vulkan::PipelinesToEvict;
 
 namespace {
@@ -66,4 +67,18 @@ TEST_CASE("The default limit fits the disk cache loaded at boot",
     // A huge cache is capped, so it can't hold its driver memory without bound.
     REQUIRE(KeptPipelinesForCache(48'000) == MaxKeptPipelines);
     static_assert(KeptPipelinesForCache(MaxKeptPipelines) == MaxKeptPipelines);
+}
+
+TEST_CASE("The cap on kept pipelines grows with RAM", "[video_core][pipeline_eviction]") {
+    constexpr u64 GiB = u64{1} << 30;
+    // Up to 16 GiB the cap stays at the fixed one.
+    REQUIRE(MaxKeptPipelinesForMemory(0) == MaxKeptPipelines);
+    REQUIRE(MaxKeptPipelinesForMemory(8 * GiB) == MaxKeptPipelines);
+    REQUIRE(MaxKeptPipelinesForMemory(16 * GiB) == 13981);
+    // 32 GiB fits a quarter of it: OoT's ~15,000-pipeline cache stays built.
+    REQUIRE(MaxKeptPipelinesForMemory(32 * GiB) == 27962);
+    REQUIRE(KeptPipelinesForCache(15'000, MaxKeptPipelinesForMemory(32 * GiB)) == 16'024);
+    // The cache size still decides below the cap.
+    REQUIRE(KeptPipelinesForCache(7316, MaxKeptPipelinesForMemory(32 * GiB)) == 8340);
+    REQUIRE(KeptPipelinesForCache(48'000, MaxKeptPipelinesForMemory(32 * GiB)) == 27962);
 }

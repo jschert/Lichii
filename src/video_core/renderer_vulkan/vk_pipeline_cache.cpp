@@ -27,6 +27,7 @@
 #include "common/scope_exit.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/memory_detect.h"
 #include "common/thread.h"
 #include "common/thread_worker.h"
 #include "core/core.h"
@@ -827,7 +828,8 @@ constexpr u64 EvictAfterFrames = 9000;
 // `cached_at_boot` pipelines from the disk cache; 0 is the old eviction (Android, or
 // EDEN_NX2_KEPT_PIPELINES=0): every pipeline unused for EvictAfterFrames is destroyed except up to
 // MaxUnusedPrebuiltPipelines prebuilt ones no draw has used. EDEN_NX2_KEPT_PIPELINES=<n> sets the
-// limit on desktop; otherwise it fits the disk cache (KeptPipelinesForCache).
+// limit on desktop; otherwise it fits the disk cache (KeptPipelinesForCache), up to a cap that
+// grows with the machine's RAM (MaxKeptPipelinesForMemory).
 size_t KeptPipelines(size_t cached_at_boot) {
 #ifdef __ANDROID__
     return 0;
@@ -846,7 +848,12 @@ size_t KeptPipelines(size_t cached_at_boot) {
         }
         return static_cast<size_t>(parsed);
     }();
-    return forced ? *forced : KeptPipelinesForCache(cached_at_boot);
+    if (forced) {
+        return *forced;
+    }
+    static const size_t max_kept =
+        MaxKeptPipelinesForMemory(Common::GetMemInfo().TotalPhysicalMemory);
+    return KeptPipelinesForCache(cached_at_boot, max_kept);
 #endif
 }
 } // Anonymous namespace
