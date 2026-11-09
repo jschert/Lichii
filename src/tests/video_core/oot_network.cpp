@@ -15,6 +15,14 @@ TEST_CASE("Ocarina of Time tonemap shaders are recognized", "[video_core][oot_ne
     STATIC_REQUIRE_FALSE(IsTonemapShader(PrepassProgramKey));
 }
 
+TEST_CASE("Ocarina of Time skips the unused dispatch only after output replacement",
+          "[video_core][oot_network]") {
+    CHECK(ShouldSkipUnusedDispatch(UnusedDispatchProgramKey, true));
+    CHECK_FALSE(ShouldSkipUnusedDispatch(UnusedDispatchProgramKey, false));
+    CHECK_FALSE(ShouldSkipUnusedDispatch(NetworkProgramKey, true));
+    CHECK_FALSE(ShouldSkipUnusedDispatch(OutputProgramKey, true));
+}
+
 TEST_CASE("Ocarina of Time network bypass follows the setting and the game",
           "[video_core][oot_network]") {
     auto& setting = Settings::values.oot_anti_aliasing;

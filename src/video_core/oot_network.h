@@ -27,6 +27,10 @@ constexpr u64 PrepassProgramKey = 0x8475d671e6967428ULL;
 constexpr u64 NetworkProgramKey = 0x42593194bb0b2b32ULL;
 constexpr u64 OutputProgramKey = 0xda6df3e54c716df2ULL;
 
+/// Heavy dispatch between Ocarina's AA prepass and network; its result is only consumed by the
+/// bypassed network (issue #942).
+constexpr u64 UnusedDispatchProgramKey = 0xd9ee412f00ce399aULL;
+
 /// Constant buffer 0 offset of the output pass's texture handle for the B10G11R11 image it writes
 /// (the scene image the rest of the frame uses).
 constexpr u32 OutputImageHandleOffset = 0xd0;
@@ -47,6 +51,12 @@ struct BypassState {
     Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig tonemapped{};
     std::atomic<bool> output_replaced{}; ///< the latest output pass was replaced
 };
+
+/// The heavy dispatch feeds only the AA network, so skip it only after the previous frame's
+/// output copy succeeded; on the first frame or after a failed copy, keep it native.
+inline bool ShouldSkipUnusedDispatch(u64 native_key, bool output_replaced) {
+    return native_key == UnusedDispatchProgramKey && output_replaced;
+}
 
 inline bool BypassEnabled(u64 program_id) {
     return program_id == ProgramId &&

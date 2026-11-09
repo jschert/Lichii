@@ -28,6 +28,9 @@ the built-in Max Resolution patch.
 dispatch (`DispatchReplaced` skips it):
 
 - the prepass and the network are skipped;
+- the heavy dispatch between them is skipped after the previous frame's output copy succeeded
+  (opt-in while it is being verified: `EDEN_NX2_OOT_SKIP_HEAVY_DISPATCH=1`; it still runs on the
+  first frame and whenever that copy fails);
 - the output pass is replaced by an `AccelerateSurfaceCopy` of the tonemapped image into the output
   pass's own target (point filter, same size; format, size and block-linear layout from the output
   pass's texture descriptor at cb0+0xd0).
@@ -66,5 +69,4 @@ The game's constants (shader hashes, program keys, the cb0 offset) are in
   keys the bypass does nothing.
 - B10G11R11 has little precision in dark tones: without the network's smoothing some banding
   shows in deep shadows.
-- The heavy dispatch between the prepass and the network still runs; its result goes unused.
 - Vulkan only: other backends never learn the tonemapped image, so the setting has no effect there.
