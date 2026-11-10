@@ -692,7 +692,17 @@ std::vector<Record> StageCache::Find(u64 unique_hash) {
                 for (u32 n = r.Get<u32>(); n > 0; --n) {
                     record.texture_checks.push_back(r.Get<Record::TextureCheck>());
                 }
-                record.answers.resize(r.Get<u32>());
+                // The answers resize allocates: bound the count against the record's remaining
+                // bytes first and reject an over-count. A count that fits the record but runs
+                // past the HeaderReadSize prefix throws into the full-record retry instead.
+                const u32 answer_count = r.Get<u32>();
+                if (static_cast<size_t>(answer_count) > body_size - r.offset) {
+                    break; // not a record this build wrote
+                }
+                if (static_cast<size_t>(answer_count) > r.data.size() - r.offset) {
+                    throw Shader::LogicError("Cached answers run past the header read");
+                }
+                record.answers.resize(answer_count);
                 r.GetBytes(record.answers.data(), record.answers.size());
                 record.raw_program_size = r.Get<u32>();
                 record.compressed_size = r.Get<u32>();
